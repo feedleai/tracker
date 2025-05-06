@@ -1,0 +1,42 @@
+face_recognition:
+  detection_size: (800, 800)
+  recognition_threshold: 0.6
+  top_k: 1
+  use_gpu: true
+
+person_tracking:
+  model_path: "yolov8n.pt"
+  confidence_threshold: 0.5
+  iou_threshold: 0.7
+  max_age: 30
+  min_hits: 3
+  use_gpu: true
+
+database:
+  db_path: "face_database.db"
+  use_db: true
+  min_detections_to_store: 3
+  update_period: 5  # Update database every N frames
+
+cameras:
+  # Local camera
+  - name: "default_camera"
+    source: "test2.mp4"
+    enabled: true
+  
+  # Example of additional camera sources
+  # - name: "front_door"
+  #   source: "rtsp://username:password@192.168.1.100:554/stream"
+  #   enabled: false
+  # 
+  # - name: "back_yard"
+  #   source: "http://192.168.1.101:8080/video"
+  #   enabled: false
+
+output:
+  show_video: true
+  save_detections: false
+  output_dir: "./detected_faces"
+  show_person_detection: true
+  show_face_recognition: true
+  show_person_id: true 
