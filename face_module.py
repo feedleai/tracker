@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import insightface
+import torch
 from insightface.app import FaceAnalysis
 from insightface.data import get_image as ins_get_image
 
@@ -30,9 +31,7 @@ class FaceModule:
         self.ctx_id = -1  # Default to CPU
         
         try:
-            import onnxruntime
-            providers = onnxruntime.get_available_providers()
-            if self.use_gpu and 'CUDAExecutionProvider' in providers:
+            if self.use_gpu and torch.cuda.is_available():
                 print("Using GPU acceleration for face recognition")
                 self.ctx_id = 0  # Use GPU
             else:
@@ -45,7 +44,10 @@ class FaceModule:
         # Initialize InsightFace model
         self.face_analyzer = FaceAnalysis(
             name="buffalo_l",  # Using a lightweight model
-            root="./models"    # Model will be downloaded to this directory
+            root="./models",
+            providers=['CUDAExecutionProvider'],
+            allowed_modules=['detection', 'recognition'],
+            det_size=(0, 0)    # Model will be downloaded to this directory
         )
         self.face_analyzer.prepare(ctx_id=self.ctx_id, det_size=self.detection_size)
         

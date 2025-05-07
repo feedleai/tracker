@@ -1948,6 +1948,85 @@ class PersonTrackingModule:
                         )
         except Exception as e:
             print(f"Error drawing predicted trajectories: {e}")
+    
+    def _draw_trajectories(self, image, tracked_persons):
+        """
+        Draw the historical trajectory paths for tracked persons.
+        
+        Args:
+            image (numpy.ndarray): Image to draw on
+            tracked_persons (dict): Dictionary of tracked persons
+        """
+        try:
+            # Draw historical trajectory for each person
+            for track_id, person_data in tracked_persons.items():
+                # Skip if person has no valid bounding box
+                if 'bbox' not in person_data or person_data['bbox'] is None:
+                    continue
+                
+                # Get the track history for this person
+                if track_id not in self.track_history:
+                    continue
+                
+                history = self.track_history[track_id]
+                if not history or len(history) < 2:
+                    continue
+                
+                # Determine color based on the person ID or track ID
+                person_id = person_data.get('person_id')
+                if person_id is not None:
+                    # Use a fixed color based on person ID for consistency
+                    color_id = person_id % 255
+                    color = (color_id, 255 - color_id, 128)
+                else:
+                    # Use a different color scheme for unidentified tracks
+                    color_id = track_id % 255
+                    color = (100, color_id, 255 - color_id)
+                
+                # Draw the trajectory lines connecting historical positions
+                for i in range(1, len(history)):
+                    prev_point = history[i-1]
+                    curr_point = history[i]
+                    
+                    # Extract points (centers of bounding boxes)
+                    prev_x, prev_y = int(prev_point[0]), int(prev_point[1])
+                    curr_x, curr_y = int(curr_point[0]), int(curr_point[1])
+                    
+                    # Check if points are within image bounds
+                    h, w = image.shape[:2]
+                    if (0 <= prev_x < w and 0 <= prev_y < h and 
+                        0 <= curr_x < w and 0 <= curr_y < h):
+                        
+                        # Calculate alpha (transparency) based on recency
+                        frames_since = self.frame_count - curr_point[2]
+                        alpha = max(0.3, 1.0 - (frames_since / 30.0))  # Fade older points
+                        
+                        # Apply alpha to color
+                        alpha_color = tuple(int(c * alpha) for c in color)
+                        
+                        # Draw line segment with decreasing thickness based on age
+                        thickness = max(1, int(3 - (i / len(history)) * 2))
+                        cv2.line(image, (prev_x, prev_y), (curr_x, curr_y), alpha_color, thickness)
+                
+                # Draw points at each position with decreasing size for older points
+                for i, point in enumerate(history):
+                    x, y = int(point[0]), int(point[1])
+                    
+                    # Check if point is within image bounds
+                    h, w = image.shape[:2]
+                    if 0 <= x < w and 0 <= y < h:
+                        # Calculate alpha (transparency) based on recency
+                        frames_since = self.frame_count - point[2]
+                        alpha = max(0.3, 1.0 - (frames_since / 30.0))
+                        
+                        # Apply alpha to color
+                        alpha_color = tuple(int(c * alpha) for c in color)
+                        
+                        # Size decreases for older points
+                        point_size = max(1, int(4 * (1.0 - i / len(history))))
+                        cv2.circle(image, (x, y), point_size, alpha_color, -1)
+        except Exception as e:
+            print(f"Error in _draw_trajectories: {e}")
 
     def _analyze_occlusions(self, tracked_persons):
         """
@@ -1957,254 +2036,4 @@ class PersonTrackingModule:
         Args:
             tracked_persons (dict): Dictionary of tracked persons
         """
-        try:
-            # Reset occlusion graph for this frame
-            current_occlusion_graph = {}
-            
-            # Extract all valid bounding boxes
-            valid_persons = {}
-            for track_id, person in tracked_persons.items():
-                if 'bbox' in person and person['bbox'] is not None:
-                    valid_persons[track_id] = person
-            
-            if len(valid_persons) < 2:
-                # Not enough people for occlusions
-                self.occlusion_graph = {}
-                return
-            
-            # Check all pairs of persons for potential occlusions
-            track_ids = list(valid_persons.keys())
-            
-            # Build size-based depth ordering (larger bboxes are likely closer to camera)
-            # This helps determine which person is in front when occlusions occur
-            size_ordering = []
-            for track_id in track_ids:
-                bbox = valid_persons[track_id]['bbox']
-                area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                size_ordering.append((track_id, area))
-            
-            # Sort by area (descending)
-            size_ordering.sort(key=lambda x: x[1], reverse=True)
-            self.depth_ordering = [track_id for track_id, _ in size_ordering]
-            
-            # Check each pair for overlaps
-            for i in range(len(track_ids)):
-                id1 = track_ids[i]
-                bbox1 = valid_persons[id1]['bbox']
-                
-                for j in range(i+1, len(track_ids)):
-                    id2 = track_ids[j]
-                    bbox2 = valid_persons[id2]['bbox']
-                    
-                    # Calculate IoU to determine if there's an overlap
-                    iou = self._calculate_iou(bbox1, bbox2)
-                    
-                    if iou > self.min_overlap_iou:
-                        # There's an overlap - determine which person is occluding the other
-                        # Several heuristics to determine occlusion ordering:
-                        
-                        # 1. Size heuristic: Larger bounding box is likely closer to camera
-                        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
-                        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
-                        
-                        # 2. Position heuristic: Lower in frame usually means closer to camera
-                        bottom1 = bbox1[3]
-                        bottom2 = bbox2[3]
-                        
-                        # 3. Occlusion heuristic: Check if one bbox contains the bottom of the other
-                        bottom_contained_1in2 = (bbox1[3] > bbox2[1] and bbox1[3] < bbox2[3] and
-                                                bbox1[0] > bbox2[0] and bbox1[2] < bbox2[2])
-                        bottom_contained_2in1 = (bbox2[3] > bbox1[1] and bbox2[3] < bbox1[3] and
-                                                bbox2[0] > bbox1[0] and bbox2[2] < bbox1[2])
-                        
-                        # Determine which person is in front based on heuristics
-                        id_front = None
-                        id_back = None
-                        
-                        # Lower bbox is usually in front
-                        if abs(bottom1 - bottom2) > 20:  # Significant difference in bottom position
-                            id_front = id1 if bottom1 > bottom2 else id2
-                            id_back = id2 if id_front == id1 else id1
-                        # Bottom contained is a strong indicator of occlusion
-                        elif bottom_contained_1in2:
-                            id_front = id2
-                            id_back = id1
-                        elif bottom_contained_2in1:
-                            id_front = id1
-                            id_back = id2
-                        # Fall back to size
-                        else:
-                            id_front = id1 if area1 > area2 else id2
-                            id_back = id2 if id_front == id1 else id1
-                        
-                        # Add to occlusion graph: key = occluding track, value = list of occluded tracks
-                        if id_front not in current_occlusion_graph:
-                            current_occlusion_graph[id_front] = []
-                        
-                        current_occlusion_graph[id_front].append(id_back)
-            
-            # Update the occlusion graph with temporal smoothing to avoid flickering
-            # If this is the first frame, just use the current graph
-            if not self.occlusion_graph:
-                self.occlusion_graph = current_occlusion_graph
-            else:
-                # Blend with previous frame's graph for stability
-                # Keep track of temporal consistency in occlusion relationships
-                for id_front, occluded_ids in current_occlusion_graph.items():
-                    if id_front not in self.occlusion_graph:
-                        self.occlusion_graph[id_front] = occluded_ids
-                    else:
-                        # Merge occluded IDs, prioritizing consistent occlusions
-                        for occluded_id in occluded_ids:
-                            if occluded_id not in self.occlusion_graph[id_front]:
-                                # New occlusion relationship
-                                self.occlusion_graph[id_front].append(occluded_id)
-                
-                # Update occlusion state history
-                for id_front, occluded_ids in self.occlusion_graph.items():
-                    for occluded_id in occluded_ids:
-                        occlusion_key = (id_front, occluded_id)
-                        
-                        if occlusion_key not in self.occlusion_state_history:
-                            self.occlusion_state_history[occlusion_key] = {
-                                'first_seen': self.frame_count,
-                                'last_seen': self.frame_count,
-                                'duration': 1,
-                                'consistent': True
-                            }
-                        else:
-                            history = self.occlusion_state_history[occlusion_key]
-                            history['last_seen'] = self.frame_count
-                            history['duration'] += 1
-                
-                # Prune old occlusion relationships that no longer exist
-                to_remove = []
-                for id_front, occluded_ids in self.occlusion_graph.items():
-                    if id_front not in current_occlusion_graph:
-                        # This occluder is no longer active
-                        to_remove.append(id_front)
-                        continue
-                    
-                    # Check each occluded ID
-                    occluded_to_remove = []
-                    for occluded_id in occluded_ids:
-                        if (id_front in current_occlusion_graph and 
-                            occluded_id not in current_occlusion_graph[id_front]):
-                            # This occlusion relationship no longer exists
-                            occluded_to_remove.append(occluded_id)
-                            
-                            # Update occlusion state history
-                            occlusion_key = (id_front, occluded_id)
-                            if occlusion_key in self.occlusion_state_history:
-                                # Mark as potentially ended if not seen for a few frames
-                                frames_since = self.frame_count - self.occlusion_state_history[occlusion_key]['last_seen']
-                                if frames_since > 5:  # Allow for some missing detections
-                                    to_remove.append(occlusion_key)
-                
-                    # Remove occluded IDs that are no longer valid
-                    for occluded_id in occluded_to_remove:
-                        if occluded_id in self.occlusion_graph[id_front]:
-                            self.occlusion_graph[id_front].remove(occluded_id)
-                
-                # Remove occlusion relationships that no longer exist
-                for id_front in to_remove:
-                    if id_front in self.occlusion_graph:
-                        del self.occlusion_graph[id_front]
-            
-            # Update spatial relationships based on occlusion graph
-            self._update_spatial_relationships(tracked_persons)
-                    
-        except Exception as e:
-            print(f"Error analyzing occlusions: {e}")
-
-    def _update_spatial_relationships(self, tracked_persons):
-        """
-        Update spatial relationships between people based on the occlusion graph.
-        This helps establish a pseudo-3D understanding of the scene.
-        
-        Args:
-            tracked_persons (dict): Dictionary of tracked persons
-        """
-        try:
-            # Skip if spatial reasoning is disabled
-            if not self.use_spatial_reasoning:
-                return
-                
-            # Reset spatial relationships
-            current_relationships = {}
-            
-            # Extract valid positions and size information
-            for track_id, person in tracked_persons.items():
-                if 'bbox' not in person or person['bbox'] is None:
-                    continue
-                    
-                bbox = person['bbox']
-                center_x = (bbox[0] + bbox[2]) / 2
-                center_y = (bbox[1] + bbox[3]) / 2
-                width = bbox[2] - bbox[0]
-                height = bbox[3] - bbox[1]
-                bottom_y = bbox[3]
-                
-                # Store position and size information
-                current_relationships[track_id] = {
-                    'position': (center_x, center_y),
-                    'bottom': bottom_y,
-                    'size': (width, height),
-                    'area': width * height,
-                    'in_front_of': [],
-                    'behind': [],
-                    'last_updated': self.frame_count
-                }
-                
-            # Update relationships based on occlusion graph
-            for occluder_id, occluded_ids in self.occlusion_graph.items():
-                if occluder_id in current_relationships:
-                    for occluded_id in occluded_ids:
-                        if occluded_id in current_relationships:
-                            # Occluder is in front of occluded
-                            current_relationships[occluder_id]['in_front_of'].append(occluded_id)
-                            current_relationships[occluded_id]['behind'].append(occluder_id)
-            
-            # Apply temporal consistency - blend with previous relationships
-            if not self.spatial_relationships:
-                self.spatial_relationships = current_relationships
-            else:
-                # Update existing relationships
-                for track_id, rel_data in current_relationships.items():
-                    if track_id in self.spatial_relationships:
-                        # Update position and size
-                        self.spatial_relationships[track_id]['position'] = rel_data['position']
-                        self.spatial_relationships[track_id]['bottom'] = rel_data['bottom']
-                        self.spatial_relationships[track_id]['size'] = rel_data['size']
-                        self.spatial_relationships[track_id]['area'] = rel_data['area']
-                        self.spatial_relationships[track_id]['last_updated'] = self.frame_count
-                        
-                        # Merge spatial relationships with temporal smoothing
-                        # Keep consistent in_front_of relationships
-                        for other_id in rel_data['in_front_of']:
-                            if other_id not in self.spatial_relationships[track_id]['in_front_of']:
-                                self.spatial_relationships[track_id]['in_front_of'].append(other_id)
-                        
-                        # Keep consistent behind relationships
-                        for other_id in rel_data['behind']:
-                            if other_id not in self.spatial_relationships[track_id]['behind']:
-                                self.spatial_relationships[track_id]['behind'].append(other_id)
-                    else:
-                        # New track, add the relationship
-                        self.spatial_relationships[track_id] = rel_data
-                
-                # Remove old relationships
-                to_remove = []
-                for track_id, rel_data in self.spatial_relationships.items():
-                    if track_id not in current_relationships:
-                        # Check if recently updated before removing
-                        frames_since = self.frame_count - rel_data['last_updated']
-                        if frames_since > 10:  # Keep relationship info for a while
-                            to_remove.append(track_id)
-                
-                for track_id in to_remove:
-                    if track_id in self.spatial_relationships:
-                        del self.spatial_relationships[track_id]
-        
-        except Exception as e:
-            print(f"Error updating spatial relationships: {e}")
+        # ... existing code ...
