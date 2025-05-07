@@ -8,7 +8,7 @@ class PersonTrackingModule:
     def __init__(self, config):
         """
         Initialize the person detection and tracking module using YOLOv8 and BoTSORT.
-        
+
         Args:
             config (dict): Configuration parameters for person tracking
         """
@@ -17,920 +17,635 @@ class PersonTrackingModule:
         self.iou_threshold = config.get('iou_threshold', 0.7)
         self.max_age = config.get('max_age', 30)
         self.min_hits = config.get('min_hits', 3)
-        
+
         # Configure GPU/CPU usage
         self.use_gpu = config.get('use_gpu', True)
-        self.device = 'cpu'
-        
+        self.device = 'cuda:0'  # Force CUDA device
+
         # Check if GPU is available
         try:
             import torch
-            if self.use_gpu and torch.cuda.is_available():
-                self.device = 'cuda:0'
+            if torch.cuda.is_available():
                 print("Using GPU acceleration for person tracking")
             else:
-                print("GPU acceleration not available for person tracking, using CPU")
+                raise RuntimeError("GPU acceleration required but CUDA is not available")
         except ImportError:
-            print("PyTorch not available, using CPU for person tracking")
-        
-        # Load YOLO model - using YOLOv8n by default
+            raise ImportError("PyTorch not available. Please install PyTorch with CUDA support")
+
+        # Load YOLO model
         model_path = config.get('model_path', 'yolov8n.pt')
-        
-        # Load YOLO model with tracking enabled using BoTSORT
         print(f"Loading YOLOv8 model from {model_path}...")
         self.model = YOLO(model_path)
-        
-        # Set device for inference
         self.model.to(self.device)
-        
-        # Class ID for person in COCO dataset (used by YOLO) is 0
+
+        # Person class ID
         self.person_class_id = 0
-        
-        # Store tracked persons
+
+        # Tracking storage
         self.tracked_persons = {}
-        
-        # Map between tracker IDs and face IDs
         self.tracker_to_face_map = {}
-        
-        # Map between tracker IDs and person IDs
         self.tracker_to_person_map = {}
-        
-        # Store appearance features for each person to help with reidentification
+
+        # Appearance & reID
         self.person_appearance_features = {}
-        
-        # Cache of recently disappeared tracks to help with reidentification
         self.disappeared_tracks = {}
-        self.max_disappearance_frames = 120  # ~4 seconds at 30 FPS - increased for better persistence
-        
-        # Track velocity of persons for motion prediction
+        self.max_disappearance_frames = 120
+
+        # Velocity & Kalman
         self.person_velocities = {}
-        
-        # Kalman filter parameters for better tracking
         self.use_kalman = config.get('use_kalman', True)
-        self.kalman_filters = {}  # Mapping of track_id to KalmanFilter objects
-        self.kalman_states = {}   # Mapping of track_id to last Kalman state
-        
-        # More sophisticated appearance feature extraction
+        self.kalman_filters = {}
+        self.kalman_states = {}
+
+        # Deep features
         self.use_deep_features = False
         try:
-            # Check if we can use OpenCV's DNN module for deeper features
             cv2.dnn.readNet
             self.use_deep_features = config.get('use_deep_features', True)
             if self.use_deep_features:
                 print("Using deep appearance features for better reidentification")
         except (AttributeError, ImportError):
             print("OpenCV DNN module not available, using basic appearance features")
-        
-        # Tracking consistency metrics
+
+        # Tracking metrics & history
         self.track_history = {}
-        self.max_track_history = 30  # Store last 30 positions for each track
-        
-        # Motion model for predicting person movements
-        self.motion_prediction_enabled = config.get('motion_prediction', True)
-        
-        # Occlusion handling - actively track through occlusions
+        self.max_track_history = 30
+        self.track_qualities = {}
+        self.track_lifetimes = {}
+        self.min_quality_threshold = config.get('min_quality_threshold', 0.3)
+
+        # Occlusion handling
         self.occlusion_threshold = config.get('occlusion_threshold', 0.4)
         self.actively_track_occlusions = config.get('track_occlusions', True)
-        
-        # Frame dimensions for motion prediction
-        self.frame_width = 1920  # Default, will be updated with actual frame dimensions
+        self.occlusion_graph = {}
+        self.occlusion_state_history = {}
+        self.occlusion_recovery_buffer = 30
+
+        # Spatial reasoning
+        self.use_spatial_reasoning = config.get('use_spatial_reasoning', True)
+        self.spatial_relationships = {}
+        self.depth_ordering = []
+        self.min_overlap_iou = config.get('min_overlap_iou', 0.1)
+
+        # Trajectory prediction
+        self.use_advanced_trajectory = config.get('use_advanced_trajectory', True)
+        self.trajectory_models = {}
+        self.trajectory_history_length = config.get('trajectory_history_length', 50)
+
+        # Identity management
+        self.person_identity_features = {}
+        self.identity_confusion_matrix = {}
+        self.last_person_positions = {}
+        self.identity_consistency_threshold = config.get('identity_consistency_threshold', 0.6)
+        self.enable_strict_identity_checking = config.get('enable_strict_identity_checking', True)
+        self.identity_feature_history = {}
+        self.max_feature_history = 10
+        self.next_generated_id = 1000
+        self.used_person_ids = set()
+
+        # Frame storage
+        self.frame_width = 1920
         self.frame_height = 1080
-        
-        # Frame counter
         self.frame_count = 0
-        
-        # Store last frame for optical flow calculations
         self.last_frame = None
         self.last_frame_gray = None
-        
+
     def detect_and_track(self, frame):
         """
         Detect and track persons in the given frame using YOLOv8 and BoTSORT.
-        
+
         Args:
             frame (numpy.ndarray): Input image frame
-            
+
         Returns:
             dict: Dictionary of tracked persons with tracker IDs as keys
         """
-        # Initialize empty result in case of early return
         tracked_persons = {}
-        
-        # Input validation
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
             print("Warning: Invalid frame passed to detect_and_track")
             return tracked_persons
-        
+
+        # Update frame dimensions & count
+        h, w = frame.shape[:2]
+        self.frame_height, self.frame_width = h, w
+        self.frame_count += 1
+
+        # Grayscale for optical flow
         try:
-            # Update frame dimensions
-            self.frame_height, self.frame_width = frame.shape[:2]
-            
-            # Increment frame counter
-            self.frame_count += 1
-            
-            # Convert frame to grayscale for optical flow
-            try:
-                frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            except Exception as e:
-                print(f"Error converting frame to grayscale: {e}")
-                frame_gray = None
-            
-            # Calculate optical flow if we have previous frame
-            flow_vectors = {}
-            if self.motion_prediction_enabled and self.last_frame_gray is not None and frame_gray is not None:
-                # Calculate optical flow for better motion prediction
-                try:
-                    # Using Lucas-Kanade method for sparse optical flow
-                    for track_id, person in self.tracked_persons.items():
-                        if 'bbox' not in person or person['bbox'] is None:
-                            continue
-                            
-                        bbox = person['bbox']
-                        if not isinstance(bbox, (list, np.ndarray)) or len(bbox) != 4:
-                            continue
-                            
-                        # Define keypoints in the bounding box
-                        try:
-                            x1, y1, x2, y2 = [int(v) for v in bbox]
-                            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
-                            
-                            # Create a grid of points within the bounding box
-                            points = []
-                            step = max(5, min((x2-x1)//4, (y2-y1)//4))  # Grid spacing based on bbox size
-                            
-                            # Add more points for larger bounding boxes
-                            for x in range(x1, x2, step):
-                                for y in range(y1, y2, step):
-                                    if 0 <= x < self.frame_width and 0 <= y < self.frame_height:
-                                        points.append([float(x), float(y)])
-                            
-                            # Add center point and corners for better coverage
-                            if 0 <= center_x < self.frame_width and 0 <= center_y < self.frame_height:
-                                points.append([float(center_x), float(center_y)])
-                                
-                            # Add corners only if they're within frame bounds
-                            if 0 <= x1 < self.frame_width and 0 <= y1 < self.frame_height:
-                                points.append([float(x1), float(y1)])
-                            if 0 <= x2 < self.frame_width and 0 <= y1 < self.frame_height:    
-                                points.append([float(x2), float(y1)])
-                            if 0 <= x1 < self.frame_width and 0 <= y2 < self.frame_height:
-                                points.append([float(x1), float(y2)])
-                            if 0 <= x2 < self.frame_width and 0 <= y2 < self.frame_height:
-                                points.append([float(x2), float(y2)])
-                            
-                            if points:
-                                points = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
-                                
-                                # Validate shapes match requirements for calcOpticalFlowPyrLK
-                                if points.shape[0] > 0 and self.last_frame_gray.shape == frame_gray.shape:
-                                    new_points, status, _ = cv2.calcOpticalFlowPyrLK(
-                                        self.last_frame_gray, 
-                                        frame_gray, 
-                                        points, 
-                                        None, 
-                                        winSize=(15, 15), 
-                                        maxLevel=2,
-                                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-                                    )
-                                    
-                                    # Filter valid points
-                                    good_new = []
-                                    good_old = []
-                                    for i, (new, old, stat) in enumerate(zip(new_points, points, status)):
-                                        if stat == 1:
-                                            good_new.append(new.ravel())
-                                            good_old.append(old.ravel())
-                                    
-                                    good_points = np.array(good_old) if good_old else None
-                                    good_new_points = np.array(good_new) if good_new else None
-                                    
-                                    if good_points is not None and good_new_points is not None and len(good_points) > 0:
-                                        # Calculate average motion vector
-                                        dx = np.mean(good_new_points[:, 0] - good_points[:, 0])
-                                        dy = np.mean(good_new_points[:, 1] - good_points[:, 1])
-                                        
-                                        # Remove outliers for more robust estimation
-                                        if len(good_points) > 4:
-                                            # Calculate individual motion vectors
-                                            motion_vectors = good_new_points - good_points
-                                            
-                                            # Calculate mean and standard deviation of motion
-                                            mean_dx = np.mean(motion_vectors[:, 0])
-                                            mean_dy = np.mean(motion_vectors[:, 1])
-                                            std_dx = np.std(motion_vectors[:, 0])
-                                            std_dy = np.std(motion_vectors[:, 1])
-                                            
-                                            # Filter points within 2 standard deviations
-                                            inliers = np.logical_and(
-                                                np.abs(motion_vectors[:, 0] - mean_dx) < 2 * std_dx,
-                                                np.abs(motion_vectors[:, 1] - mean_dy) < 2 * std_dy
-                                            )
-                                            
-                                            if np.sum(inliers) > 0:
-                                                # Recalculate mean with inliers only
-                                                dx = np.mean(motion_vectors[inliers, 0])
-                                                dy = np.mean(motion_vectors[inliers, 1])
-                                        
-                                        # Store flow vector
-                                        flow_vectors[track_id] = (dx, dy)
-                        except Exception as e:
-                            print(f"Error processing optical flow points for track {track_id}: {e}")
-                except Exception as e:
-                    print(f"Error calculating optical flow: {e}")
-            
-            # Run the model with tracking enabled
-            try:
-                results = self.model.track(
-                    frame, 
-                    conf=self.confidence_threshold,
-                    iou=self.iou_threshold,
-                    persist=True,  # Remember tracks between frames
-                    tracker="botsort.yaml",  # Use BoTSORT tracker
-                    device=self.device  # Specify device for inference
-                )
-            except Exception as e:
-                print(f"Error running YOLO model: {e}")
-                # Create empty results to avoid crashes
-                results = None
-            
-            # First, predict new positions for previously tracked persons
-            predicted_boxes = {}
-            if self.motion_prediction_enabled:
-                for track_id, person in self.tracked_persons.items():
-                    try:
-                        if 'bbox' not in person or person['bbox'] is None:
-                            continue
-                            
-                        # Get predicted motion from optical flow
-                        dx, dy = 0, 0
-                        if track_id in flow_vectors:
-                            dx, dy = flow_vectors[track_id]
-                        
-                        # Get velocity from history
-                        vx, vy = 0, 0
-                        if track_id in self.person_velocities:
-                            vx, vy = self.person_velocities[track_id]
-                            
-                        # Combine flow and velocity for prediction with better outlier rejection
-                        flow_magnitude = np.sqrt(dx**2 + dy**2)
-                        velocity_magnitude = np.sqrt(vx**2 + vy**2)
-                        
-                        # Use flow only if it's not too large (reject erratic motions)
-                        if flow_magnitude < 30 and abs(flow_magnitude - velocity_magnitude) < 20:
-                            # Weighted average of flow and velocity (favor flow for fast adaptation)
-                            pred_dx = 0.7 * dx + 0.3 * vx
-                            pred_dy = 0.7 * dy + 0.3 * vy
-                        else:
-                            # Flow is erratic, use velocity only
-                            pred_dx = vx
-                            pred_dy = vy
-                        
-                        # Predict new bounding box
-                        bbox = person['bbox'].copy()
-                        predicted_box = [
-                            bbox[0] + pred_dx,
-                            bbox[1] + pred_dy,
-                            bbox[2] + pred_dx,
-                            bbox[3] + pred_dy
-                        ]
-                        
-                        # Ensure predicted box is within frame
-                        predicted_box[0] = max(0, min(predicted_box[0], self.frame_width-1))
-                        predicted_box[1] = max(0, min(predicted_box[1], self.frame_height-1))
-                        predicted_box[2] = max(0, min(predicted_box[2], self.frame_width-1))
-                        predicted_box[3] = max(0, min(predicted_box[3], self.frame_height-1))
-                        
-                        predicted_boxes[track_id] = predicted_box
-                    except Exception as e:
-                        print(f"Error predicting box for track {track_id}: {e}")
-            
-            # Process YOLO detections
-            if results and len(results) > 0:
-                try:
-                    # Extract tracking results
-                    detections = results[0]
-                    
-                    if detections.boxes is not None and len(detections.boxes) > 0:
-                        boxes = detections.boxes
-                        
-                        for i, box in enumerate(boxes):
-                            try:
-                                # Check if this is a person class detection
-                                cls = int(box.cls.item()) if hasattr(box.cls, 'item') else int(box.cls)
-                                if cls != self.person_class_id:
-                                    continue
-                                    
-                                # Get tracking ID if available
-                                if box.id is not None:
-                                    track_id = int(box.id.item()) if hasattr(box.id, 'item') else int(box.id)
-                                else:
-                                    continue  # Skip detections without tracking IDs
-                                    
-                                # Get bounding box
-                                x1, y1, x2, y2 = box.xyxy[0].tolist() if hasattr(box.xyxy[0], 'tolist') else box.xyxy[0]
-                                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                                
-                                # Validate bounding box
-                                if x1 >= x2 or y1 >= y2:
-                                    continue
-                                    
-                                # Ensure box is within frame boundaries
-                                x1 = max(0, min(x1, self.frame_width-1))
-                                y1 = max(0, min(y1, self.frame_height-1))
-                                x2 = max(0, min(x2, self.frame_width-1))
-                                y2 = max(0, min(y2, self.frame_height-1))
-                                
-                                # Get confidence
-                                conf = float(box.conf.item()) if hasattr(box.conf, 'item') else float(box.conf)
-                                
-                                # Get face ID and person ID if previously associated
-                                face_id = self.tracker_to_face_map.get(track_id, None)
-                                person_id = self.tracker_to_person_map.get(track_id, None)
-                                
-                                # Apply Kalman filter to smooth bounding box if enabled
-                                if self.use_kalman:
-                                    try:
-                                        bbox_array = np.array([x1, y1, x2, y2])
-                                        # Update Kalman filter with current detection
-                                        smoothed_bbox = self._update_kalman_filter(track_id, bbox_array)
-                                        # Apply smoothed coordinates
-                                        x1, y1, x2, y2 = [int(v) for v in smoothed_bbox]
-                                    except Exception as e:
-                                        print(f"Error applying Kalman filter: {e}")
-                                
-                                # Extract appearance features for this person (color histogram)
-                                appearance = self._extract_appearance_features(frame, [x1, y1, x2, y2])
-                                
-                                # Calculate velocity if this is a previously tracked person
-                                vx, vy = 0, 0
-                                if track_id in self.tracked_persons and 'bbox' in self.tracked_persons[track_id]:
-                                    prev_bbox = self.tracked_persons[track_id]['bbox']
-                                    prev_cx = (prev_bbox[0] + prev_bbox[2]) / 2
-                                    prev_cy = (prev_bbox[1] + prev_bbox[3]) / 2
-                                    curr_cx = (x1 + x2) / 2
-                                    curr_cy = (y1 + y2) / 2
-                                    vx = curr_cx - prev_cx
-                                    vy = curr_cy - prev_cy
-                                    
-                                    # Reject outliers for more robust velocity estimation
-                                    # If velocity suddenly changes a lot, smooth it more aggressively
-                                    if track_id in self.person_velocities:
-                                        prev_vx, prev_vy = self.person_velocities[track_id]
-                                        v_change = np.sqrt((vx - prev_vx)**2 + (vy - prev_vy)**2)
-                                        
-                                        # If velocity change is large, use more of the previous velocity
-                                        if v_change > 10:
-                                            # More aggressive smoothing (30% new, 70% old)
-                                            vx = 0.3 * vx + 0.7 * prev_vx
-                                            vy = 0.3 * vy + 0.7 * prev_vy
-                                        else:
-                                            # Normal smoothing (80% new, 20% old)
-                                            vx = 0.8 * vx + 0.2 * prev_vx
-                                            vy = 0.8 * vy + 0.2 * prev_vy
-                                        
-                                # Store updated velocity
-                                self.person_velocities[track_id] = (vx, vy)
-                                
-                                # Update track history for this person
-                                if track_id not in self.track_history:
-                                    self.track_history[track_id] = []
-                                
-                                # Add current position to history
-                                center_x = (x1 + x2) / 2
-                                center_y = (y1 + y2) / 2
-                                self.track_history[track_id].append((center_x, center_y, self.frame_count))
-                                
-                                # Keep only recent history
-                                if len(self.track_history[track_id]) > self.max_track_history:
-                                    self.track_history[track_id] = self.track_history[track_id][-self.max_track_history:]
-                                
-                                # Determine occlusion status
-                                occlusion_status = 'visible'
-                                # Advanced occlusion detection will be handled in _handle_occlusions
-                                
-                                # Store the person
-                                tracked_persons[track_id] = {
-                                    'bbox': np.array([x1, y1, x2, y2]),
-                                    'confidence': conf,
-                                    'class_id': cls,
-                                    'face_id': face_id,
-                                    'person_id': person_id,
-                                    'appearance': appearance,
-                                    'velocity': (vx, vy),
-                                    'last_seen': self.frame_count,
-                                    'occlusion_status': occlusion_status
-                                }
-                            except Exception as e:
-                                print(f"Error processing detection {i}: {e}")
-                                continue
-                except Exception as e:
-                    print(f"Error processing YOLO results: {e}")
-            
-            # Check for occlusions and predict occluded person positions
-            if self.actively_track_occlusions:
-                try:
-                    self._handle_occlusions(frame, tracked_persons, predicted_boxes)
-                except Exception as e:
-                    print(f"Error handling occlusions: {e}")
-            
-            # Update disappeared tracks
-            try:
-                self._update_disappeared_tracks(tracked_persons)
-            except Exception as e:
-                print(f"Error updating disappeared tracks: {e}")
-            
-            # Store current frame for next optical flow calculation
-            self.last_frame = frame.copy()
-            self.last_frame_gray = frame_gray
-            
-            # Try to reidentify new tracks with recently disappeared ones
-            try:
-                # Only process tracks that are new (not in previous frame)
-                for track_id, person_data in tracked_persons.items():
-                    if track_id not in self.tracked_persons and len(self.disappeared_tracks) > 0:
-                        # Skip if already identified in this frame
-                        if person_data.get('face_id') is None and person_data.get('person_id') is None:
-                            self._try_reid_disappeared_track(track_id, person_data)
-            except Exception as e:
-                print(f"Error reidentifying new tracks: {e}")
-            
-            # Update stored tracked persons
-            self.tracked_persons = tracked_persons
-            
-            return tracked_persons
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         except Exception as e:
-            print(f"Unexpected error in detect_and_track: {e}")
-            return tracked_persons
-    
+            print(f"Error converting frame to grayscale: {e}")
+            frame_gray = None
+
+        # Optical flow vectors
+        flow_vectors = {}
+        if self.last_frame_gray is not None and frame_gray is not None and self.actively_track_occlusions:
+            try:
+                for tid, person in self.tracked_persons.items():
+                    bbox = person.get('bbox')
+                    if bbox is None or len(bbox) != 4:
+                        continue
+                    x1, y1, x2, y2 = map(int, bbox)
+                    cx, cy = (x1+x2)//2, (y1+y2)//2
+                    points = []
+                    step = max(5, min((x2-x1)//4, (y2-y1)//4))
+                    for x in range(x1, x2, step):
+                        for y in range(y1, y2, step):
+                            if 0 <= x < w and 0 <= y < h:
+                                points.append([float(x), float(y)])
+                    points.append([float(cx), float(cy)])
+                    pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+                    new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                        self.last_frame_gray, frame_gray, pts, None,
+                        winSize=(15, 15), maxLevel=2,
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+                    )
+                    good_old = pts[status.flatten()==1].reshape(-1, 2)
+                    good_new = new_pts[status.flatten()==1].reshape(-1, 2)
+                    if len(good_old) > 0:
+                        dx, dy = np.mean(good_new - good_old, axis=0)
+                        flow_vectors[tid] = (dx, dy)
+            except Exception as e:
+                print(f"Error calculating optical flow: {e}")
+
+        # Run YOLO tracking
+        try:
+            results = self.model.track(
+                frame,
+                conf=self.confidence_threshold,
+                iou=self.iou_threshold,
+                persist=True,
+                tracker="botsort.yaml",
+                device=self.device
+            )
+        except Exception as e:
+            print(f"Error running YOLO model: {e}")
+            results = None
+
+        # Predict boxes using flow + velocity
+        predicted_boxes = {}
+        if self.use_advanced_trajectory:
+            for tid, person in self.tracked_persons.items():
+                bbox = person.get('bbox')
+                if bbox is None:
+                    continue
+                dx, dy = flow_vectors.get(tid, (0, 0))
+                vx, vy = self.person_velocities.get(tid, (0, 0))
+                mag_f = np.hypot(dx, dy)
+                mag_v = np.hypot(vx, vy)
+                if mag_f < 30 and abs(mag_f - mag_v) < 20:
+                    pdx = 0.7 * dx + 0.3 * vx
+                    pdy = 0.7 * dy + 0.3 * vy
+                else:
+                    pdx, pdy = vx, vy
+                x1, y1, x2, y2 = bbox
+                pb = [
+                    max(0, min(x1 + pdx, w-1)),
+                    max(0, min(y1 + pdy, h-1)),
+                    max(0, min(x2 + pdx, w-1)),
+                    max(0, min(y2 + pdy, h-1))
+                ]
+                predicted_boxes[tid] = pb
+
+        # Process detections
+        if results and len(results) > 0:
+            det = results[0]
+            boxes = getattr(det, 'boxes', [])
+            if boxes is not None:
+                self._update_track_qualities()
+                for box in boxes:
+                    cls = int(box.cls.item()) if hasattr(box.cls, 'item') else int(box.cls)
+                    if cls != self.person_class_id:
+                        continue
+                    tid = int(box.id.item()) if hasattr(box.id, 'item') else int(box.id)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    if x1 >= x2 or y1 >= y2:
+                        continue
+                    x1, x2 = max(0, x1), min(w-1, x2)
+                    y1, y2 = max(0, y1), min(h-1, y2)
+                    conf = float(box.conf.item()) if hasattr(box.conf, 'item') else float(box.conf)
+                    face_id = self.tracker_to_face_map.get(tid)
+                    person_id = self.tracker_to_person_map.get(tid)
+                    if self.use_kalman:
+                        try:
+                            sm = self._update_kalman_filter(tid, np.array([x1, y1, x2, y2]))
+                            x1, y1, x2, y2 = map(int, sm)
+                        except Exception as e:
+                            print(f"Error applying Kalman filter: {e}")
+                    appearance = self._extract_appearance_features(frame, [x1, y1, x2, y2])
+                    vx, vy = 0, 0
+                    if tid in self.tracked_persons:
+                        prev_bbox = self.tracked_persons[tid]['bbox']
+                        prev_cx, prev_cy = (prev_bbox[0] + prev_bbox[2]) / 2, (prev_bbox[1] + prev_bbox[3]) / 2
+                        curr_cx, curr_cy = (x1 + x2) / 2, (y1 + y2) / 2
+                        vx, vy = curr_cx - prev_cx, curr_cy - prev_cy
+                        if tid in self.person_velocities:
+                            pvx, pvy = self.person_velocities[tid]
+                            vchg = np.hypot(vx - pvx, vy - pvy)
+                            if vchg > 10:
+                                vx = 0.3 * vx + 0.7 * pvx
+                                vy = 0.3 * vy + 0.7 * pvy
+                            else:
+                                vx = 0.8 * vx + 0.2 * pvx
+                                vy = 0.8 * vy + 0.2 * pvy
+                    self.person_velocities[tid] = (vx, vy)
+                    hist = self.track_history.setdefault(tid, [])
+                    hist.append(((x1 + x2) / 2, (y1 + y2) / 2, self.frame_count))
+                    if len(hist) > self.max_track_history:
+                        hist[:] = hist[-self.max_track_history:]
+                    tracked_persons[tid] = {
+                        'bbox': np.array([x1, y1, x2, y2]),
+                        'confidence': conf,
+                        'class_id': cls,
+                        'face_id': face_id,
+                        'person_id': person_id,
+                        'appearance': appearance,
+                        'velocity': (vx, vy),
+                        'last_seen': self.frame_count,
+                        'occlusion_status': 'visible'
+                    }
+                    self._update_track_quality(tid, tracked_persons[tid])
+
+        # Trajectory & occlusion post-processing
+        if self.use_advanced_trajectory:
+            try:
+                self._predict_trajectories(tracked_persons)
+            except Exception:
+                pass
+        try:
+            self._analyze_occlusions(tracked_persons)
+        except Exception:
+            pass
+        if self.actively_track_occlusions:
+            try:
+                self._handle_occlusions(frame, tracked_persons, predicted_boxes)
+            except Exception:
+                pass
+        self._update_disappeared_tracks(tracked_persons)
+        self.last_frame, self.last_frame_gray = frame.copy(), frame_gray
+
+        # Re-identify disappeared tracks
+        for tid, data in tracked_persons.items():
+            if tid not in self.tracked_persons:
+                try:
+                    self._try_reid_disappeared_track(tid, data)
+                except Exception:
+                    pass
+
+        self.tracked_persons = tracked_persons
+        return tracked_persons
+
     def draw_persons(self, frame, tracked_persons=None, show_person_id=True):
         """
-        Draw bounding boxes and IDs on the detected persons.
-        
-        Args:
-            frame (numpy.ndarray): Input image frame
-            tracked_persons (dict, optional): Dictionary of tracked persons. If None, uses the current tracked persons.
-            show_person_id (bool): Whether to show person IDs (from face recognition)
-            
-        Returns:
-            numpy.ndarray: Frame with drawn person information
+        Draw bounding boxes, trajectories, and IDs on the frame.
         """
         if tracked_persons is None:
             tracked_persons = self.tracked_persons
-            
         if not tracked_persons:
             return frame
-            
-        result_frame = frame.copy()
-        
-        # Create a mapping of person IDs to their initial face IDs for consistent display
+        out = frame.copy()
+
+        # Initial face map for label consistency
         person_to_initial_face = {}
-        for track_id, person_data in tracked_persons.items():
-            person_id = person_data.get('person_id', None)
-            face_id = person_data.get('face_id', None)
-            if person_id is not None and face_id is not None:
-                if person_id in person_to_initial_face:
-                    if face_id < person_to_initial_face[person_id]:
-                        person_to_initial_face[person_id] = face_id
-                else:
-                    person_to_initial_face[person_id] = face_id
-        
+        for tid, pd in tracked_persons.items():
+            pid, fid = pd.get('person_id'), pd.get('face_id')
+            if pid is not None and fid is not None:
+                person_to_initial_face[pid] = min(fid, person_to_initial_face.get(pid, fid))
+
         try:
-            # First draw trajectories for all tracked persons
-            self._draw_trajectories(result_frame, tracked_persons)
+            self._draw_trajectories(out, tracked_persons)
+            if self.use_advanced_trajectory:
+                self._draw_predicted_trajectories(out, tracked_persons)
         except Exception as e:
             print(f"Error drawing trajectories: {e}")
-        
-        # Then draw bounding boxes
-        for track_id, person_data in tracked_persons.items():
+
+        for tid, pd in tracked_persons.items():
             try:
-                # Only draw if this person is currently tracked and has a valid bounding box
-                if 'bbox' not in person_data:
+                bb = pd.get('bbox')
+                if bb is None or len(bb) != 4:
                     continue
-                    
-                # Bounding box validation
-                bbox = person_data['bbox']
-                if bbox is None or len(bbox) != 4:
-                    print(f"Invalid bbox for track_id {track_id}: {bbox}")
-                    continue
-                
-                # Ensure the bounding box coordinates are valid integers and within frame boundaries
+                x1, y1, x2, y2 = map(int, bb)
                 h, w = frame.shape[:2]
-                x1 = max(0, min(int(bbox[0]), w-1))
-                y1 = max(0, min(int(bbox[1]), h-1))
-                x2 = max(0, min(int(bbox[2]), w-1))
-                y2 = max(0, min(int(bbox[3]), h-1))
-                
-                # Skip invalid bounding boxes
+                x1, x2 = max(0, x1), min(w-1, x2)
+                y1, y2 = max(0, y1), min(h-1, y2)
                 if x1 >= x2 or y1 >= y2:
-                    print(f"Invalid bbox dimensions for track_id {track_id}: [{x1},{y1},{x2},{y2}]")
                     continue
-                
-                # Get associated face ID and person ID if available
-                face_id = person_data.get('face_id', None)
-                person_id = person_data.get('person_id', None)
-                
-                # Use the initial face ID for this person for consistent display
-                display_id = face_id
-                if person_id is not None and person_id in person_to_initial_face:
-                    display_id = person_to_initial_face[person_id]
-                
-                # Check if face is visible
-                face_visible = True
-                if 'face_data' in person_data and face_id is not None:
-                    face_data = person_data.get('face_data', {})
-                    face_visible = face_data.get('visible', True)
-                    frames_since_seen = face_data.get('frames_since_seen', 0)
-                    # Only consider the face to be visible if it's actually visible or very recently seen
-                    face_visible = face_visible or frames_since_seen <= 3
-                
-                # Get occlusion status
-                occlusion_status = person_data.get('occlusion_status', 'visible')
-                
-                # Adjust color based on identification and occlusion status
-                if occlusion_status == 'fully_occluded':
-                    # For occluded tracks, use dashed lines with identification color
-                    if person_id is not None:
-                        color = (0, 180, 0)  # Darker green for occluded identified person
-                    elif face_id is not None:
-                        color = (0, 180, 180)  # Darker yellow for occluded face detected
-                    else:
-                        color = (180, 0, 0)  # Darker blue for occluded unknown person
-                    
-                    # Draw dashed bounding box for occluded persons
-                    self._draw_dashed_rectangle(result_frame, (x1, y1, x2, y2), color, thickness=2)
+
+                pid, fid = pd.get('person_id'), pd.get('face_id')
+                if pid is not None:
+                    color = (0, 255, 0)
+                elif fid is not None:
+                    color = (0, 255, 255)
                 else:
-                    # For visible tracks, use solid lines with bright colors
-                    if person_id is not None:
-                        color = (0, 255, 0)  # Green - person identified
-                    elif face_id is not None:
-                        color = (0, 255, 255)  # Yellow - face detected but not identified
-                    else:
-                        color = (255, 0, 0)  # Blue - no face detected
-                    
-                    # Draw solid rectangle for visible persons
-                    cv2.rectangle(
-                        result_frame, 
-                        (x1, y1), 
-                        (x2, y2), 
-                        color, 
-                        2
-                    )
-                
-                # Add confidence indicator (thickness of the box relates to confidence)
-                confidence = person_data.get('confidence', 1.0)
-                thickness = max(1, int(confidence * 3))
-                
-                # Draw tracking ID and face/person ID if available
-                label_parts = []
-                if show_person_id and person_id is not None:
-                    if display_id is not None:
-                        label_parts.append(f"Person: {person_id}")
-                        # Only show face ID if different from person ID
-                        if display_id != person_id:
-                            label_parts.append(f"Face: {display_id}")
-                    else:
-                        label_parts.append(f"Person: {person_id}")
-                elif face_id is not None:
-                    label_parts.append(f"Face: {display_id}")
-                    label_parts.append(f"Track: {track_id}")
+                    color = (255, 0, 0)
+
+                cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+                thickness = max(1, int(pd.get('confidence', 1.0) * 3))
+
+                # Build label
+                display_id = fid if pid is None else person_to_initial_face.get(pid, fid)
+                parts = []
+                if show_person_id and pid is not None:
+                    parts.append(f"Person: {pid}")
+                    if display_id is not None and display_id != pid:
+                        parts.append(f"Face: {display_id}")
+                elif fid is not None:
+                    parts.append(f"Face: {display_id}")
+                    parts.append(f"Track: {tid}")
                 else:
-                    label_parts.append(f"Track: {track_id}")
-                
-                # Add occlusion status for non-visible persons
-                if occlusion_status != 'visible':
-                    label_parts.append(f"({occlusion_status.replace('_', ' ')})")
-                
-                # Join all label parts
-                label = " | ".join(label_parts)
-                
-                # Add background to text for better visibility
-                text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, thickness)
-                cv2.rectangle(
-                    result_frame,
-                    (x1, y1 - 20),
-                    (x1 + text_size[0], y1),
-                    (0, 0, 0),
-                    -1
-                )
-                
-                # Draw the label
-                cv2.putText(
-                    result_frame, 
-                    label, 
-                    (x1, y1 - 5), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, 
-                    color, 
-                    thickness
-                )
-                
-                # Draw velocity vector if available
-                if 'velocity' in person_data:
-                    vx, vy = person_data['velocity']
-                    # Only draw significant motion
-                    if abs(vx) > 0.5 or abs(vy) > 0.5:
-                        center_x = int((x1 + x2) / 2)
-                        center_y = int((y1 + y2) / 2)
-                        # Scale vector for visibility
-                        end_x = int(center_x + vx * 3)
-                        end_y = int(center_y + vy * 3)
-                        
-                        # Draw arrow showing velocity
-                        cv2.arrowedLine(
-                            result_frame,
-                            (center_x, center_y),
-                            (end_x, end_y),
-                            (255, 0, 255),  # Magenta for velocity
-                            thickness=2,
-                            tipLength=0.3
-                        )
+                    parts.append(f"Track: {tid}")
+
+                oc = pd.get('occlusion_status', 'visible')
+                if oc != 'visible':
+                    parts.append(f"({oc.replace('_', ' ')})")
+
+                label = " | ".join(parts)
+                ts, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, thickness)
+                cv2.rectangle(out, (x1, y1-20), (x1+ts[0], y1), (0, 0, 0), -1)
+                cv2.putText(out, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, thickness)
+
+                # Velocity arrow
+                vx, vy = pd.get('velocity', (0, 0))
+                if abs(vx) > 0.5 or abs(vy) > 0.5:
+                    cx, cy = (x1+x2)//2, (y1+y2)//2
+                    ex, ey = int(cx + vx*3), int(cy + vy*3)
+                    cv2.arrowedLine(out, (cx, cy), (ex, ey), (255, 0, 255), 2, tipLength=0.3)
             except Exception as e:
-                print(f"Error drawing person {track_id}: {e}")
-                continue
-                    
-        return result_frame
-        
-    def _draw_dashed_rectangle(self, image, bbox, color, thickness=1, dash_length=10):
-        """
-        Draw a dashed rectangle on an image.
-        
-        Args:
-            image (numpy.ndarray): Image to draw on
-            bbox (list or numpy.ndarray): Bounding box coordinates [x1, y1, x2, y2]
-            color (tuple): BGR color
-            thickness (int): Line thickness
-            dash_length (int): Length of each dash
-        """
-        try:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            
-            # Draw top line
-            for x in range(x1, x2, dash_length*2):
-                x_end = min(x + dash_length, x2)
-                cv2.line(image, (x, y1), (x_end, y1), color, thickness)
-                
-            # Draw bottom line
-            for x in range(x1, x2, dash_length*2):
-                x_end = min(x + dash_length, x2)
-                cv2.line(image, (x, y2), (x_end, y2), color, thickness)
-                
-            # Draw left line
-            for y in range(y1, y2, dash_length*2):
-                y_end = min(y + dash_length, y2)
-                cv2.line(image, (x1, y), (x1, y_end), color, thickness)
-                
-            # Draw right line
-            for y in range(y1, y2, dash_length*2):
-                y_end = min(y + dash_length, y2)
-                cv2.line(image, (x2, y), (x2, y_end), color, thickness)
-        except Exception as e:
-            print(f"Error drawing dashed rectangle: {e}")
-            
-    def _draw_trajectories(self, image, tracked_persons):
-        """
-        Draw motion trajectories for tracked persons.
-        
-        Args:
-            image (numpy.ndarray): Image to draw on
-            tracked_persons (dict): Dictionary of tracked persons
-        """
-        for track_id, person_data in tracked_persons.items():
-            try:
-                # Skip if no trajectory data
-                if track_id not in self.track_history or len(self.track_history[track_id]) < 2:
-                    continue
-                    
-                # Get trajectory points
-                trajectory = self.track_history[track_id]
-                
-                # Get person color based on identification
-                person_id = person_data.get('person_id', None)
-                face_id = person_data.get('face_id', None)
-                
-                if person_id is not None:
-                    color = (0, 255, 0)  # Green for identified person
-                elif face_id is not None:
-                    color = (0, 255, 255)  # Yellow for face detected
-                else:
-                    color = (255, 0, 0)  # Blue for unknown person
-                    
-                # Draw trajectory line
-                for i in range(1, len(trajectory)):
-                    try:
-                        pt1 = (int(trajectory[i-1][0]), int(trajectory[i-1][1]))
-                        pt2 = (int(trajectory[i][0]), int(trajectory[i][1]))
-                        
-                        # Calculate alpha (opacity) based on recency
-                        current_frame = self.frame_count
-                        alpha = min(1.0, 0.3 + 0.7 * (current_frame - trajectory[i-1][2]) / self.max_track_history)
-                        
-                        # Scale color by alpha for fading effect
-                        scaled_color = tuple(int(c * alpha) for c in color)
-                        
-                        # Draw a line segment
-                        cv2.line(image, pt1, pt2, scaled_color, thickness=2)
-                    except Exception as e:
-                        print(f"Error drawing trajectory segment: {e}")
-                        continue
-            except Exception as e:
-                print(f"Error drawing trajectory for track {track_id}: {e}")
-                continue
-    
+                print(f"Error drawing person {tid}: {e}")
+        return out
+
     def update_face_associations(self, tracked_persons, tracked_faces, face_module=None):
         """
-        Associate tracked persons with detected faces based on IoU overlap.
-        
-        Args:
-            tracked_persons (dict): Dictionary of tracked persons with tracker IDs as keys
-            tracked_faces (dict): Dictionary of tracked faces with face IDs as keys
-            face_module (FaceModule, optional): Face module to get person IDs from face IDs
-            
-        Returns:
-            dict: Updated tracked persons with face ID associations
+        Associate tracked persons with tracked faces based on IoU and consistency checks.
         """
         if not tracked_persons or not tracked_faces:
             return tracked_persons
-            
-        # Create a mapping of person IDs to their initial face ID
-        # This helps us maintain consistent face ID assignment
-        person_to_initial_face = {}
-        for face_id, face_data in tracked_faces.items():
-            person_id = face_data.get('person_id', None)
-            if person_id is not None:
-                if person_id in person_to_initial_face:
-                    if face_id < person_to_initial_face[person_id]:
-                        person_to_initial_face[person_id] = face_id
-                else:
-                    person_to_initial_face[person_id] = face_id
-            
-        # For each person, find the best matching face based on IoU
-        for track_id, person in tracked_persons.items():
-            person_bbox = person['bbox']
-            best_iou = 0
-            best_face_id = None
-            best_person_id = None
-            best_face_data = None
-            
-            # If this tracker already has a person ID, try to use the initial face ID for that person
-            current_person_id = person.get('person_id', None)
-            if current_person_id is not None and current_person_id in person_to_initial_face:
-                initial_face_id = person_to_initial_face[current_person_id]
-                if initial_face_id in tracked_faces:
-                    # Update the face ID to the initial one for consistency
-                    best_face_id = initial_face_id
-                    best_person_id = current_person_id
-                    best_face_data = tracked_faces[initial_face_id]
-            
-            # If we don't have an initial face ID for this person yet, compute IoU with all faces
-            if best_face_id is None:
-                for face_id, face_data in tracked_faces.items():
-                    face_bbox = face_data['bbox']
-                    
-                    # Calculate IoU between person and face bounding boxes
-                    iou = self._calculate_iou(person_bbox, face_bbox)
-                    
-                    # Update best match if IoU is higher
-                    if iou > best_iou and iou > 0.5:  # Threshold for considering a match
-                        best_iou = iou
-                        best_face_id = face_id
-                        best_face_data = face_data
-                        
-                        # Get person ID from face if available
-                        if 'person_id' in face_data:
-                            best_person_id = face_data['person_id']
-                        elif face_module is not None:
-                            # Try to get person ID from face module
-                            best_person_id = face_module.get_person_id_from_face_id(face_id)
-            
-            # Update person with face ID and person ID if found
-            if best_face_id is not None:
-                person['face_id'] = best_face_id
-                self.tracker_to_face_map[track_id] = best_face_id
-                
-                # Store face visibility and other relevant data
-                if best_face_data is not None:
-                    person['face_data'] = {
-                        'visible': best_face_data.get('visible', True),
-                        'frames_since_seen': best_face_data.get('frames_since_seen', 0),
-                        'first_seen': best_face_data.get('first_seen', 0),
-                        'last_seen': best_face_data.get('last_seen', 0)
-                    }
-                
-                if best_person_id is not None:
-                    person['person_id'] = best_person_id
-                    self.tracker_to_person_map[track_id] = best_person_id
-                    
-                    # Check if we found a face ID that doesn't match the initial face ID for this person
-                    # If so, update our mapping to ensure consistency
-                    if best_person_id in person_to_initial_face:
-                        initial_face_id = person_to_initial_face[best_person_id]
-                        if initial_face_id != best_face_id and initial_face_id < best_face_id:
-                            # Use the smaller (earlier) face ID for this person
-                            person['face_id'] = initial_face_id
-                            self.tracker_to_face_map[track_id] = initial_face_id
-                            # Update face data if available
-                            if initial_face_id in tracked_faces:
-                                face_data = tracked_faces[initial_face_id]
-                                person['face_data'] = {
-                                    'visible': face_data.get('visible', True),
-                                    'frames_since_seen': face_data.get('frames_since_seen', 0),
-                                    'first_seen': face_data.get('first_seen', 0),
-                                    'last_seen': face_data.get('last_seen', 0)
-                                }
-                    else:
-                        # This is a new person-face association, add to our mapping
-                        person_to_initial_face[best_person_id] = best_face_id
-        
-        return tracked_persons
+        try:
+            # Initial face per person
+            person_to_initial_face = {}
+            for fid, fd in tracked_faces.items():
+                pid = fd.get('person_id')
+                if pid is not None:
+                    person_to_initial_face[pid] = min(fid, person_to_initial_face.get(pid, fid))
+                    self.used_person_ids.add(pid)
+
+            # Compute IoU overlap scores
+            overlap_scores = []
+            for tid, pd in tracked_persons.items():
+                pb = pd['bbox']
+                for fid, fd in tracked_faces.items():
+                    fb = fd['bbox']
+                    iou = self._calculate_iou(pb, fb)
+                    if iou > 0.3:
+                        overlap_scores.append((tid, fid, iou))
+            overlap_scores.sort(key=lambda x: x[2], reverse=True)
+
+            assigned, rev = {}, {}
+            for tid, fid, iou in overlap_scores:
+                if tid not in assigned and fid not in rev:
+                    assigned[tid] = fid
+                    rev[fid] = tid
+
+            # Assign and consistency checks
+            for tid, pd in tracked_persons.items():
+                prev_fid = pd.get('face_id')
+                prev_pid = pd.get('person_id')
+                if tid in assigned:
+                    fid = assigned[tid]
+                    new_pid = tracked_faces[fid].get('person_id')
+                    if prev_pid is not None and new_pid is not None and prev_pid != new_pid and self.enable_strict_identity_checking:
+                        old_feats = self.person_identity_features.get(tid)
+                        new_feats = self.person_identity_features.get(new_pid)
+                        sim = self._compare_identity_features(old_feats, new_feats)
+                        if sim < self.identity_consistency_threshold:
+                            # Reject
+                            conflict = (prev_pid, new_pid)
+                            self.identity_confusion_matrix[conflict] = self.identity_confusion_matrix.get(conflict, 0) + 1
+                            pd['face_id'] = prev_fid
+                            pd['person_id'] = prev_pid
+                            continue
+                    pd['face_id'] = fid
+                    self.tracker_to_face_map[tid] = fid
+                    if new_pid is not None:
+                        pd['person_id'] = new_pid
+                        self.tracker_to_person_map[tid] = new_pid
+                        self._update_identity_features(tid, pd, new_pid)
+                        self.used_person_ids.add(new_pid)
+                elif prev_fid is not None and prev_fid in tracked_faces and prev_fid not in rev:
+                    fb = tracked_faces[prev_fid]['bbox']
+                    pb = pd['bbox']
+                    fc = ((fb[0]+fb[2])/2, (fb[1]+fb[3])/2)
+                    pc = ((pb[0]+pb[2])/2, (pb[1]+pb[3])/2)
+                    dist = np.hypot(fc[0]-pc[0], fc[1]-pc[1])
+                    height = pb[3] - pb[1]
+                    if dist < height * 0.5:
+                        pd['face_id'] = prev_fid
+                        rev[prev_fid] = tid
+
+            if self.enable_strict_identity_checking:
+                self._resolve_identity_conflicts(tracked_persons)
+            return tracked_persons
+        except Exception as e:
+            print(f"Error in update_face_associations: {e}")
+            return tracked_persons
     
+    def _compare_identity_features(self, features1, features2):
+        """
+        Compare two sets of identity features for similarity.
+        
+        Args:
+            features1 (dict): First feature set
+            features2 (dict): Second feature set
+            
+        Returns:
+            float: Similarity score (0-1)
+        """
+        try:
+            if features1 is None or features2 is None:
+                return 0.0
+                
+            scores = []
+            
+            # Compare appearances using our existing method
+            if ('appearance' in features1 and 'appearance' in features2 and
+                features1['appearance'] is not None and features2['appearance'] is not None):
+                app_score = self._compare_appearances(features1['appearance'], features2['appearance'])
+                scores.append(app_score * 0.6)  # Appearance is most important
+            
+            # Compare height
+            if ('height' in features1 and 'height' in features2 and
+                features1['height'] is not None and features2['height'] is not None):
+                height1 = features1['height']
+                height2 = features2['height']
+                height_ratio = min(height1, height2) / max(height1, height2)
+                scores.append(height_ratio * 0.2)
+            
+            # Compare aspect ratio
+            if ('aspect_ratio' in features1 and 'aspect_ratio' in features2 and
+                features1['aspect_ratio'] is not None and features2['aspect_ratio'] is not None):
+                ar1 = features1['aspect_ratio']
+                ar2 = features2['aspect_ratio']
+                ar_ratio = min(ar1, ar2) / max(ar1, ar2)
+                scores.append(ar_ratio * 0.2)
+            
+            # Calculate overall similarity
+            if not scores:
+                return 0.0
+                
+            return sum(scores) / sum(s > 0 for s in scores)
+        except Exception as e:
+            print(f"Error comparing identity features: {e}")
+            return 0.0
+    
+    def _resolve_identity_conflicts(self, tracked_persons):
+        """
+        Resolve any remaining identity conflicts by ensuring unique person IDs.
+        
+        Args:
+            tracked_persons (dict): Dictionary of tracked persons
+        """
+        try:
+            # First, identify all currently active person IDs
+            active_person_ids = {}
+            for track_id, person in tracked_persons.items():
+                person_id = person.get('person_id')
+                if person_id is not None:
+                    if person_id not in active_person_ids:
+                        active_person_ids[person_id] = [track_id]
+                    else:
+                        active_person_ids[person_id].append(track_id)
+            
+            # For each person ID that appears multiple times, resolve conflicts
+            for person_id, track_ids in active_person_ids.items():
+                if len(track_ids) > 1:
+                    print(f"Detected ID conflict: Person ID {person_id} assigned to {len(track_ids)} tracks")
+                    
+                    # Find the track with the highest quality/confidence
+                    best_track_id = None
+                    best_quality = -1
+                    
+                    for track_id in track_ids:
+                        person = tracked_persons[track_id]
+                        # Use track quality if available, otherwise use detection confidence
+                        quality = self.track_qualities.get(track_id, {}).get('overall', 0)
+                        confidence = person.get('confidence', 0)
+                        combined_score = quality * 0.7 + confidence * 0.3
+                        
+                        if combined_score > best_quality:
+                            best_quality = combined_score
+                            best_track_id = track_id
+                    
+                    # The best track keeps the original ID, others get new IDs
+                    for track_id in track_ids:
+                        if track_id != best_track_id:
+                            person = tracked_persons[track_id]
+                            # Generate a new unique ID
+                            new_id = self._generate_unique_person_id()
+                            
+                            print(f"Reassigning track {track_id} from person ID {person_id} to {new_id}")
+                            
+                            # Update with new ID
+                            person['person_id'] = new_id
+                            self.tracker_to_person_map[track_id] = new_id
+                            
+                            # Clone identity features if they exist
+                            if person_id in self.person_identity_features:
+                                self.person_identity_features[new_id] = self.person_identity_features[person_id].copy()
+        except Exception as e:
+            print(f"Error resolving identity conflicts: {e}")
+    
+    def _generate_unique_person_id(self):
+        """
+        Generate a unique person ID that hasn't been used before.
+        
+        Returns:
+            int: New unique person ID
+        """
+        # Start from our next available ID
+        new_id = self.next_generated_id
+        
+        # Find an ID that's not in use
+        while new_id in self.used_person_ids:
+            new_id += 1
+        
+        # Update next ID and mark as used
+        self.next_generated_id = new_id + 1
+        self.used_person_ids.add(new_id)
+        
+        return new_id
+    
+                    
     def get_person_face_crops(self, frame, tracked_persons):
         """
         Get face region crops from tracked persons for face recognition.
-        
+
         Args:
             frame (numpy.ndarray): Input image frame
             tracked_persons (dict): Dictionary of tracked persons
-            
+
         Returns:
             dict: Dictionary mapping person track_id to face region crop
         """
         face_crops = {}
-        
+
         # Validate input frame
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
             print("Warning: Invalid frame passed to get_person_face_crops")
             return face_crops
-        
+
         # Get frame dimensions for boundary checking
         frame_height, frame_width = frame.shape[:2]
-        
+
         for track_id, person in tracked_persons.items():
             try:
                 # Skip if this person already has a face ID
                 if person.get('face_id') is not None:
                     continue
-                
-                # Validate person has a valid bbox
+
+                # Validate bbox
                 if 'bbox' not in person or person['bbox'] is None:
                     continue
-                
                 bbox = person['bbox']
-                
-                # Ensure bbox is a valid array with 4 elements
+
+                # Check bbox format
                 if not isinstance(bbox, (list, np.ndarray)) or len(bbox) != 4:
                     continue
-                
-                # Ensure all bbox values are numeric and not NaN
+
+                # Check numeric
                 try:
                     if any(not np.isfinite(coord) for coord in bbox):
                         continue
                 except TypeError:
                     continue
-                
-                # Ensure bbox has valid dimensions (width and height > 0)
-                if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+
+                x1, y1, x2, y2 = bbox
+                if x2 <= x1 or y2 <= y1:
                     continue
-                
-                # Extract the face region (upper portion of person bbox)
-                # Assuming the face is in the top 1/3 of the person
-                try:
-                    face_height = max(1, int((bbox[3] - bbox[1]) // 3))
-                    face_bbox = [
-                        max(0, int(bbox[0])),
-                        max(0, int(bbox[1])),
-                        min(frame_width - 1, int(bbox[2])),
-                        min(frame_height - 1, int(bbox[1] + face_height))
-                    ]
-                except (ValueError, TypeError) as e:
-                    print(f"Error calculating face bbox for track {track_id}: {e}")
+
+                # Define face region (top 1/3)
+                face_height = max(1, int((y2 - y1) // 3))
+                fx1 = max(0, int(x1))
+                fy1 = max(0, int(y1))
+                fx2 = min(frame_width - 1, int(x2))
+                fy2 = min(frame_height - 1, int(y1 + face_height))
+
+                if fx2 <= fx1 or fy2 <= fy1:
                     continue
-                
-                # Additional validation to ensure face_bbox has valid dimensions
-                if face_bbox[0] >= face_bbox[2] or face_bbox[1] >= face_bbox[3]:
+
+                face_img = frame[fy1:fy2, fx1:fx2]
+                if face_img.size == 0:
                     continue
-                
-                # Extract face region with robust error handling
-                try:
-                    face_img = frame[face_bbox[1]:face_bbox[3], face_bbox[0]:face_bbox[2]]
-                    
-                    # Verify the crop has valid dimensions
-                    if face_img.size == 0 or face_img.shape[0] == 0 or face_img.shape[1] == 0:
-                        continue
-                    
-                    # Store the crop with its bbox
-                    face_crops[track_id] = {
-                        'crop': face_img,
-                        'bbox': np.array(face_bbox, dtype=np.int32)  # Ensure integer type
-                    }
-                except Exception as e:
-                    print(f"Error extracting face crop for track {track_id}: {e}")
-                    continue
-                
+
+                face_crops[track_id] = {
+                    'crop': face_img,
+                    'bbox': np.array([fx1, fy1, fx2, fy2], dtype=np.int32)
+                }
+
             except Exception as e:
-                print(f"Unexpected error processing track {track_id}: {e}")
+                print(f"Error extracting face crop for track {track_id}: {e}")
                 continue
-            
-        return face_crops 
+
+        return face_crops
 
     def _calculate_iou(self, bbox1, bbox2):
         """
@@ -1203,6 +918,7 @@ class PersonTrackingModule:
     def _handle_occlusions(self, frame, tracked_persons, predicted_boxes):
         """
         Handle occlusions by detecting overlaps and predicting occluded person positions.
+        Enhanced to use the occlusion graph for more accurate prediction of occluded persons.
         
         Args:
             frame (numpy.ndarray): Current frame
@@ -1210,6 +926,12 @@ class PersonTrackingModule:
             predicted_boxes (dict): Predicted bounding boxes from motion model
         """
         try:
+            # Extract occluded persons from the occlusion graph
+            occluded_persons = set()
+            for occluder_id, occluded_ids in self.occlusion_graph.items():
+                for occluded_id in occluded_ids:
+                    occluded_persons.add(occluded_id)
+            
             # Create a map of all detected boxes for occlusion checking
             all_boxes = {track_id: person['bbox'] for track_id, person in tracked_persons.items() 
                         if 'bbox' in person and person['bbox'] is not None}
@@ -1235,22 +957,105 @@ class PersonTrackingModule:
                         continue
                         
                     frames_since_seen = self.frame_count - prev_person.get('last_seen', 0)
-                    if frames_since_seen > 15:  # Only try to recover recent disappearances (increased from 10)
+                    
+                    # Use occlusion graph to determine if this person is likely occluded
+                    is_known_occluded = track_id in occluded_persons
+                    
+                    # For known occluded persons, we keep them longer
+                    max_frames_to_keep = self.occlusion_recovery_buffer if is_known_occluded else 15
+                    
+                    if frames_since_seen > max_frames_to_keep:
                         continue
                     
-                    # Get predicted position from motion model or previous position
-                    if track_id in predicted_boxes:
-                        pred_bbox = predicted_boxes[track_id].copy()
-                    else:
-                        # Use Kalman filter prediction if available 
-                        kalman_pred = None
-                        if self.use_kalman:
-                            kalman_pred = self._predict_kalman(track_id)
-                            
+                    # Check track quality to decide whether to keep predicting
+                    track_quality = self.track_qualities.get(track_id, {}).get('overall', 0.5)
+                    
+                    # We're more lenient with high-quality tracks and known occluded persons
+                    quality_threshold = self.min_quality_threshold * 0.8 if is_known_occluded else self.min_quality_threshold
+                    if track_quality < quality_threshold and frames_since_seen > 5 and not is_known_occluded:
+                        # Low quality tracks are dropped more quickly
+                        continue
+                    
+                    # Get best predicted position using our advanced trajectory models
+                    pred_bbox = None
+                    
+                    # Try advanced trajectory prediction first (most accurate)
+                    if self.use_advanced_trajectory and track_id in self.trajectory_models:
+                        model = self.trajectory_models[track_id]
+                        
+                        # Select the best prediction model based on track quality and trajectory characteristics
+                        predictions = model.get('predictions', {})
+                        
+                        if predictions:
+                            # For known occluded persons, prefer motion-aware predictions
+                            if is_known_occluded and track_id in self.spatial_relationships:
+                                # Get IDs of people occluding this person
+                                occluders = self.spatial_relationships[track_id].get('behind', [])
+                                
+                                # If we have occluders with velocity, adjust prediction based on their motion
+                                if occluders and any(occ_id in self.person_velocities for occ_id in occluders):
+                                    # Use occluder's velocity to help predict the occluded person's movement
+                                    for occ_id in occluders:
+                                        if occ_id in tracked_persons and occ_id in self.person_velocities:
+                                            # Get occluder's velocity
+                                            occ_vx, occ_vy = self.person_velocities[occ_id]
+                                            
+                                            # If the occluder is moving significantly, adjust prediction
+                                            if abs(occ_vx) > 2 or abs(occ_vy) > 2:
+                                                # Get last known position
+                                                bbox = prev_person['bbox']
+                                                
+                                                # Apply occluder's velocity with dampening
+                                                dampening = 0.7  # Assume occluded person moves somewhat with occluder
+                                                pred_bbox = [
+                                                    bbox[0] + occ_vx * dampening,
+                                                    bbox[1] + occ_vy * dampening,
+                                                    bbox[2] + occ_vx * dampening,
+                                                    bbox[3] + occ_vy * dampening
+                                                ]
+                                                break  # Use first significant occluder
+                        
+                            # If no special occlusion handling applied, use standard prediction methods
+                            if pred_bbox is None:
+                                # Determine which prediction method to use based on track quality and trajectory complexity
+                                prediction_method = 'linear'  # Default to linear
+                                
+                                # Use curvature to determine path complexity
+                                curvatures = model.get('curvatures', [])
+                                avg_curvature = np.mean(curvatures) if curvatures else 0
+                                
+                                # If high quality track with significant curvature, use curve prediction
+                                if track_quality > 0.7 and avg_curvature > 0.2 and 'curve' in predictions:
+                                    prediction_method = 'curve'
+                                # If moderate quality with some acceleration, use quadratic
+                                elif track_quality > 0.5 and 'quadratic' in predictions:
+                                    prediction_method = 'quadratic'
+                                # Otherwise use linear for simplicity and reliability
+                                
+                                # Get prediction for current frame
+                                frame_offset = min(frames_since_seen, len(predictions.get(prediction_method, [])) - 1)
+                                if frame_offset >= 0 and prediction_method in predictions and len(predictions[prediction_method]) > frame_offset:
+                                    pred_x, pred_y, pred_w, pred_h = predictions[prediction_method][frame_offset]
+                                    
+                                    # Convert center and dimensions to bbox format
+                                    pred_bbox = [
+                                        pred_x - pred_w/2,  # x1
+                                        pred_y - pred_h/2,  # y1
+                                        pred_x + pred_w/2,  # x2
+                                        pred_y + pred_h/2   # y2
+                                    ]
+                
+                    # If no advanced prediction, try Kalman filter
+                    if pred_bbox is None and self.use_kalman:
+                        kalman_pred = self._predict_kalman(track_id)
                         if kalman_pred is not None:
                             pred_bbox = kalman_pred
+                    
+                    # If still no prediction, fall back to simpler velocity-based prediction
+                    if pred_bbox is None:
+                        if track_id in predicted_boxes:
+                            pred_bbox = predicted_boxes[track_id].copy()
                         else:
-                            # Fall back to simple velocity prediction
                             # Use previous bbox and apply velocity if available
                             pred_bbox = prev_person['bbox'].copy()
                             if track_id in self.person_velocities:
@@ -1269,39 +1074,68 @@ class PersonTrackingModule:
                     # Check if the predicted bbox is occluded by any current detection
                     is_occluded = False
                     occluding_tracks = []
+                    occlusion_confidence = 0.0
                     
-                    # First check using IoU for direct overlaps
-                    for other_id, other_bbox in all_boxes.items():
-                        iou = self._calculate_iou(pred_bbox, other_bbox)
-                        if iou > self.occlusion_threshold:
-                            is_occluded = True
-                            occluding_tracks.append(other_id)
-                    
-                    # If not found by IoU, check using proximity between centers
-                    if not is_occluded and person_centers:
-                        for other_id, (cx, cy) in person_centers.items():
-                            # Calculate distance between centers
-                            distance = np.sqrt((pred_cx - cx)**2 + (pred_cy - cy)**2)
-                            
-                            # Check if distance is small enough to consider an occlusion
-                            # Scale threshold based on person size
-                            if track_id in self.tracked_persons and 'bbox' in self.tracked_persons[track_id]:
-                                person_width = self.tracked_persons[track_id]['bbox'][2] - self.tracked_persons[track_id]['bbox'][0]
-                                person_height = self.tracked_persons[track_id]['bbox'][3] - self.tracked_persons[track_id]['bbox'][1]
-                                size_threshold = max(person_width, person_height) * 0.5
+                    # For known occluded persons from the occlusion graph, force occlusion status
+                    if is_known_occluded:
+                        is_occluded = True
+                        occlusion_confidence = 0.8
+                        
+                        # Find occluders from the graph
+                        for occluder_id, occluded_ids in self.occlusion_graph.items():
+                            if track_id in occluded_ids and occluder_id in tracked_persons:
+                                occluding_tracks.append(occluder_id)
+                    else:
+                        # Standard occlusion detection for non-graph-tracked occlusions
+                        # First check using IoU for direct overlaps
+                        for other_id, other_bbox in all_boxes.items():
+                            iou = self._calculate_iou(pred_bbox, other_bbox)
+                            if iou > self.occlusion_threshold:
+                                is_occluded = True
+                                occluding_tracks.append(other_id)
+                                occlusion_confidence = max(occlusion_confidence, iou)
+                        
+                        # If not found by IoU, check using proximity between centers
+                        if not is_occluded and person_centers:
+                            for other_id, (cx, cy) in person_centers.items():
+                                # Calculate distance between centers
+                                distance = np.sqrt((pred_cx - cx)**2 + (pred_cy - cy)**2)
                                 
-                                if distance < size_threshold:
-                                    is_occluded = True
-                                    occluding_tracks.append(other_id)
+                                # Check if distance is small enough to consider an occlusion
+                                # Scale threshold based on person size
+                                if track_id in self.tracked_persons and 'bbox' in self.tracked_persons[track_id]:
+                                    person_width = self.tracked_persons[track_id]['bbox'][2] - self.tracked_persons[track_id]['bbox'][0]
+                                    person_height = self.tracked_persons[track_id]['bbox'][3] - self.tracked_persons[track_id]['bbox'][1]
+                                    size_threshold = max(person_width, person_height) * 0.5
+                                    
+                                    if distance < size_threshold:
+                                        is_occluded = True
+                                        occluding_tracks.append(other_id)
+                                        occlusion_confidence = max(occlusion_confidence, 1.0 - (distance / size_threshold))
                     
                     # Determine if this person is likely still in the frame
                     in_frame = self._is_within_bounds(pred_bbox, margin=0.05)
                     
                     # If this track is likely occluded or still in frame bounds, keep tracking it
                     if is_occluded or in_frame:
+                        # Use track quality to determine base confidence
+                        base_confidence = max(0.3, track_quality) if track_id in self.track_qualities else 0.5
+                        
                         # Decay confidence based on how long since last seen
                         confidence_decay = max(0.3, 1.0 - 0.05 * frames_since_seen)
-                        base_confidence = prev_person.get('confidence', 0.5)
+                        
+                        # Boost confidence for known occluded persons
+                        if is_known_occluded:
+                            confidence_decay *= 1.3  # 30% boost for known occlusions
+                        
+                        # Boost confidence if we're using advanced trajectory prediction
+                        if self.use_advanced_trajectory and track_id in self.trajectory_models:
+                            model = self.trajectory_models[track_id]
+                            if model.get('predictions'):
+                                confidence_decay *= 1.2  # 20% boost for advanced prediction
+                        
+                        # Final confidence is product of base and decay
+                        final_confidence = base_confidence * confidence_decay
                         
                         # Carry forward the track with predicted position
                         appearance = prev_person.get('appearance', None)
@@ -1311,21 +1145,33 @@ class PersonTrackingModule:
                         # Get velocity with decay
                         vx, vy = self.person_velocities.get(track_id, (0, 0))
                         
-                        # Decay velocity for occluded tracks
-                        vx *= 0.95  # Slower decay for more persistent prediction
-                        vy *= 0.95
+                        # Decay velocity - slower decay for known occlusions
+                        vx_decay = 0.98 if is_known_occluded else 0.95 
+                        vy_decay = 0.98 if is_known_occluded else 0.95
+                        vx *= vx_decay
+                        vy *= vy_decay
                         self.person_velocities[track_id] = (vx, vy)
                         
                         # Determine occlusion status
                         if is_occluded:
-                            occlusion_status = 'fully_occluded'
+                            occlusion_status = 'fully_occluded' if occlusion_confidence > 0.7 else 'partially_occluded'
                         else:
                             occlusion_status = 'out_of_frame'
+                        
+                        # Set confidence based on occlusion relationship consistency
+                        if is_known_occluded:
+                            for occluder_id in occluding_tracks:
+                                occlusion_key = (occluder_id, track_id)
+                                if occlusion_key in self.occlusion_state_history:
+                                    history = self.occlusion_state_history[occlusion_key]
+                                    # Longer occlusion relationships get more confidence
+                                    if history['duration'] > 5:
+                                        final_confidence *= 1.1  # Another 10% boost for consistent occlusions
                         
                         # Add to tracked_persons with occluded status
                         tracked_persons[track_id] = {
                             'bbox': np.array(pred_bbox),
-                            'confidence': base_confidence * confidence_decay,
+                            'confidence': final_confidence,
                             'class_id': prev_person.get('class_id', self.person_class_id),
                             'face_id': face_id,
                             'person_id': person_id,
@@ -1334,7 +1180,9 @@ class PersonTrackingModule:
                             'last_seen': prev_person.get('last_seen', self.frame_count - frames_since_seen),
                             'frames_since_seen': frames_since_seen,
                             'occlusion_status': occlusion_status,
-                            'occluded_by': occluding_tracks if is_occluded else []
+                            'occluded_by': occluding_tracks if is_occluded else [],
+                            'track_quality': track_quality,
+                            'known_occluded': is_known_occluded  # Flag for special handling in visualization
                         }
                         
                         # Update track history even for occluded tracks
@@ -1344,8 +1192,14 @@ class PersonTrackingModule:
                                 self.track_history[track_id] = self.track_history[track_id][-self.max_track_history:]
                 except Exception as e:
                     print(f"Error handling occlusion for track {track_id}: {e}")
+                    continue  # Skip this track and continue with others
+        except Exception as e:
+            print(f"Error in _handle_occlusions for track {track_id}: {e}")
+            # Skip this track and continue with others
+            tracked_persons[track_id] = prev_person
         except Exception as e:
             print(f"Error in _handle_occlusions: {e}")
+            return tracked_persons  # Return what we have so far
 
     def _try_reid_disappeared_track(self, track_id, track_data):
         """
@@ -1692,3 +1546,665 @@ class PersonTrackingModule:
         except Exception as e:
             print(f"Error predicting with Kalman filter for track {track_id}: {e}")
             return None 
+
+    def _predict_trajectories(self, tracked_persons):
+        """
+        Predict future trajectories for all tracked persons using multiple models.
+        This improves prediction accuracy by combining different prediction methods.
+        
+        Args:
+            tracked_persons (dict): Currently tracked persons
+        """
+        # Skip if no tracks to process
+        if not tracked_persons:
+            return
+        
+        # Update trajectory models for each person
+        for track_id, person in tracked_persons.items():
+            try:
+                if 'bbox' not in person or person['bbox'] is None:
+                    continue
+                    
+                bbox = person['bbox']
+                cx = (bbox[0] + bbox[2]) / 2
+                cy = (bbox[1] + bbox[3]) / 2
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                
+                # Initialize trajectory model if this is a new track
+                if track_id not in self.trajectory_models:
+                    self.trajectory_models[track_id] = {
+                        'positions': [],
+                        'timestamps': [],
+                        'velocities': [],
+                        'accelerations': [],
+                        'curvatures': [],
+                        'predictions': {},
+                        'last_updated': self.frame_count
+                    }
+                
+                model = self.trajectory_models[track_id]
+                
+                # Add current position to trajectory history
+                model['positions'].append((cx, cy, w, h))
+                model['timestamps'].append(self.frame_count)
+                
+                # Keep only recent history
+                if len(model['positions']) > self.trajectory_history_length:
+                    model['positions'] = model['positions'][-self.trajectory_history_length:]
+                    model['timestamps'] = model['timestamps'][-self.trajectory_history_length:]
+                
+                # Need at least 3 points for velocity and acceleration calculation
+                if len(model['positions']) >= 3:
+                    # Calculate velocities (first derivative of position)
+                    positions = np.array(model['positions'])
+                    times = np.array(model['timestamps'])
+                    
+                    # Velocities: change in position over time
+                    # Using finite difference for approximation
+                    velocities = []
+                    for i in range(1, len(positions)):
+                        dt = max(1, times[i] - times[i-1])  # Time difference (at least 1 frame)
+                        dx = positions[i][0] - positions[i-1][0]  # Change in x
+                        dy = positions[i][1] - positions[i-1][1]  # Change in y
+                        velocities.append((dx/dt, dy/dt))
+                    
+                    model['velocities'] = velocities
+                    
+                    # Accelerations: change in velocity over time (second derivative)
+                    # Need at least 2 velocity measurements
+                    if len(velocities) >= 2:
+                        accelerations = []
+                        for i in range(1, len(velocities)):
+                            dt = max(1, times[i] - times[i-1])
+                            dvx = velocities[i][0] - velocities[i-1][0]
+                            dvy = velocities[i][1] - velocities[i-1][1]
+                            accelerations.append((dvx/dt, dvy/dt))
+                        
+                        model['accelerations'] = accelerations
+                    
+                    # Calculate curvature (how much the path is bending)
+                    if len(positions) >= 3:
+                        curvatures = []
+                        for i in range(1, len(positions)-1):
+                            # Get three consecutive points
+                            p1 = positions[i-1][:2]  # Only x,y
+                            p2 = positions[i][:2]
+                            p3 = positions[i+1][:2]
+                            
+                            # Calculate vectors
+                            v1 = np.array(p2) - np.array(p1)
+                            v2 = np.array(p3) - np.array(p2)
+                            
+                            # Calculate angle between vectors (in radians)
+                            if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+                                dot_product = np.dot(v1, v2)
+                                magnitudes = np.linalg.norm(v1) * np.linalg.norm(v2)
+                                angle = np.arccos(np.clip(dot_product / magnitudes, -1.0, 1.0))
+                                curvatures.append(angle)
+                            else:
+                                curvatures.append(0)
+                        
+                        model['curvatures'] = curvatures
+                    
+                    # Make predictions using multiple methods
+                    predictions = {}
+                    
+                    # 1. Linear prediction (extrapolation of current velocity)
+                    if len(velocities) > 0:
+                        last_vx, last_vy = velocities[-1]
+                        last_x, last_y, last_w, last_h = positions[-1]
+                        
+                        # Predict next 15 positions (0.5 second at 30 FPS)
+                        linear_predictions = []
+                        for i in range(1, 16):
+                            pred_x = last_x + last_vx * i
+                            pred_y = last_y + last_vy * i
+                            linear_predictions.append((pred_x, pred_y, last_w, last_h))
+                        
+                        predictions['linear'] = linear_predictions
+                    
+                    # 2. Quadratic prediction (accounts for acceleration)
+                    if len(model['accelerations']) > 0:
+                        last_ax, last_ay = model['accelerations'][-1]
+                        last_vx, last_vy = velocities[-1]
+                        last_x, last_y, last_w, last_h = positions[-1]
+                        
+                        quadratic_predictions = []
+                        for i in range(1, 16):
+                            # s = s0 + v0*t + 0.5*a*t^2
+                            pred_x = last_x + last_vx * i + 0.5 * last_ax * i * i
+                            pred_y = last_y + last_vy * i + 0.5 * last_ay * i * i
+                            quadratic_predictions.append((pred_x, pred_y, last_w, last_h))
+                        
+                        predictions['quadratic'] = quadratic_predictions
+                    
+                    # 3. Curve fitting prediction (for complex trajectories)
+                    if len(positions) >= 5:  # Need enough points for curve fitting
+                        try:
+                            # Extract x and y coordinates
+                            xs = [p[0] for p in positions[-10:]]  # Last 10 positions
+                            ys = [p[1] for p in positions[-10:]]
+                            ts = [t - times[-10] for t in times[-10:]]  # Relative times
+                            
+                            # Fit polynomial for x and y separately
+                            # Higher degree for more complex paths, lower for simpler ones
+                            # Use track quality to determine polynomial degree
+                            quality = self.track_qualities.get(track_id, {}).get('overall', 0.5)
+                            degree = 2 if quality > 0.7 else 1  # More complex model for high-quality tracks
+                            
+                            if len(xs) > degree:  # Need more points than polynomial degree
+                                x_poly = np.polyfit(ts, xs, degree)
+                                y_poly = np.polyfit(ts, ys, degree)
+                                
+                                # Generate predictions
+                                curve_predictions = []
+                                last_w, last_h = positions[-1][2], positions[-1][3]
+                                
+                                for i in range(1, 16):
+                                    t = ts[-1] + i  # Future time
+                                    pred_x = np.polyval(x_poly, t)
+                                    pred_y = np.polyval(y_poly, t)
+                                    curve_predictions.append((pred_x, pred_y, last_w, last_h))
+                                
+                                predictions['curve'] = curve_predictions
+                        except Exception as e:
+                            print(f"Error in curve fitting prediction: {e}")
+                    
+                    # Store all predictions
+                    model['predictions'] = predictions
+                    model['last_updated'] = self.frame_count
+            except Exception as e:
+                print(f"Error updating trajectory model for track {track_id}: {e}")
+                continue
+            
+    def _update_track_qualities(self):
+        """
+        Update quality metrics for all tracks to assess tracking reliability.
+        This helps identify and handle unreliable tracks.
+        """
+        # Skip if no tracks exist
+        if not self.tracked_persons:
+            return
+            
+        # Go through all existing tracks
+        for track_id, person in self.tracked_persons.items():
+            try:
+                # Initialize quality metrics if this is a new track
+                if track_id not in self.track_qualities:
+                    self.track_qualities[track_id] = {
+                        'detection_confidence': 0.0,
+                        'temporal_consistency': 0.0,
+                        'velocity_stability': 0.0,
+                        'appearance_consistency': 0.0,
+                        'overall': 0.0,
+                        'history': []
+                    }
+            except Exception as e:
+                print(f"Error initializing track quality for track {track_id}: {e}")
+                
+    def _update_track_quality(self, track_id, person_data):
+        """
+        Update quality metrics for a specific track.
+        
+        Args:
+            track_id (int): Track ID
+            person_data (dict): Current track data
+        """
+        try:
+            # Initialize if not already present
+            if track_id not in self.track_qualities:
+                self.track_qualities[track_id] = {
+                    'detection_confidence': 0.0,
+                    'temporal_consistency': 0.0,
+                    'velocity_stability': 0.0,
+                    'appearance_consistency': 0.0,
+                    'overall': 0.0,
+                    'history': []
+                }
+                
+            quality = self.track_qualities[track_id]
+            
+            # 1. Detection confidence (from detector)
+            current_conf = person_data.get('confidence', 0.5)
+            quality['detection_confidence'] = current_conf
+            
+            # 2. Temporal consistency (regular detections over time)
+            if track_id in self.track_history and len(self.track_history[track_id]) > 1:
+                # Calculate time gaps between detections
+                times = [pos[2] for pos in self.track_history[track_id]]
+                gaps = np.diff(times)
+                avg_gap = np.mean(gaps)
+                consistency = max(0, min(1, 1.0 - (avg_gap - 1) / 10))  # Normalize: 1 is perfect, >10 is poor
+                quality['temporal_consistency'] = consistency
+            else:
+                quality['temporal_consistency'] = 0.5  # Default for new tracks
+            
+            # 3. Velocity stability (consistent motion)
+            if track_id in self.person_velocities:
+                if 'history' in quality and len(quality['history']) > 0:
+                    # Compare current velocity with historical average
+                    vx, vy = self.person_velocities[track_id]
+                    v_magnitude = np.sqrt(vx*vx + vy*vy)
+                    
+                    # Get velocity history
+                    v_history = [entry.get('velocity_magnitude', 0) for entry in quality['history'][-5:]]
+                    if v_history:
+                        # Calculate stability as inverse of velocity variance
+                        avg_v = np.mean(v_history)
+                        if avg_v > 0:
+                            variance = np.mean([(v - avg_v)**2 for v in v_history + [v_magnitude]])
+                            stability = max(0, min(1, 1.0 - variance / (avg_v + 1e-5)))
+                            quality['velocity_stability'] = stability
+            
+            # 4. Appearance consistency
+            if 'appearance' in person_data and person_data['appearance'] is not None:
+                if 'history' in quality and len(quality['history']) > 0:
+                    # Get most recent appearance
+                    recent_appearances = [
+                        entry.get('appearance') for entry in quality['history'][-5:]
+                        if 'appearance' in entry and entry['appearance'] is not None
+                    ]
+                    
+                    if recent_appearances:
+                        # Calculate average appearance similarity
+                        similarities = []
+                        for prev_appearance in recent_appearances:
+                            try:
+                                sim = self._compare_appearances(person_data['appearance'], prev_appearance)
+                                similarities.append(sim)
+                            except Exception:
+                                pass
+                        
+                        if similarities:
+                            avg_similarity = np.mean(similarities)
+                            quality['appearance_consistency'] = avg_similarity
+            
+            # Update history with current information
+            quality['history'].append({
+                'frame': self.frame_count,
+                'confidence': current_conf,
+                'velocity_magnitude': np.sqrt(person_data['velocity'][0]**2 + person_data['velocity'][1]**2)
+                    if 'velocity' in person_data else 0,
+                'appearance': person_data.get('appearance')
+            })
+            
+            # Keep history manageable
+            if len(quality['history']) > 20:
+                quality['history'] = quality['history'][-20:]
+            
+            # Calculate overall quality
+            weights = {
+                'detection_confidence': 0.3,
+                'temporal_consistency': 0.2,
+                'velocity_stability': 0.2,
+                'appearance_consistency': 0.3
+            }
+            
+            overall = sum(
+                quality[metric] * weight
+                for metric, weight in weights.items()
+                if quality[metric] is not None
+            )
+            
+            # Store overall quality
+            quality['overall'] = overall
+        except Exception as e:
+            print(f"Error updating track quality for track {track_id}: {e}")
+    
+    def _draw_predicted_trajectories(self, image, tracked_persons):
+        """
+        Draw predicted future trajectories for occluded or partially visible persons.
+        
+        Args:
+            image (numpy.ndarray): Image to draw on
+            tracked_persons (dict): Dictionary of tracked persons
+        """
+        try:
+            for track_id, person_data in tracked_persons.items():
+                # Only draw predictions for occluded tracks or those with uncertain detection
+                occlusion_status = person_data.get('occlusion_status', 'visible')
+                confidence = person_data.get('confidence', 1.0)
+                
+                if (occlusion_status != 'visible' or confidence < 0.7) and track_id in self.trajectory_models:
+                    model = self.trajectory_models[track_id]
+                    predictions = model.get('predictions', {})
+                    
+                    if not predictions:
+                        continue
+                    
+                    # Determine best prediction method
+                    # For visualization, use curve if available, then quadratic, then linear
+                    method = None
+                    for preferred in ['curve', 'quadratic', 'linear']:
+                        if preferred in predictions:
+                            method = preferred
+                            break
+                        
+                    if method is None:
+                        continue
+                    
+                    # Get prediction
+                    future_points = predictions[method]
+                    
+                    if not future_points:
+                        continue
+                    
+                    # Determine line color based on occlusion status and track quality
+                    track_quality = self.track_qualities.get(track_id, {}).get('overall', 0.5)
+                    
+                    if occlusion_status == 'fully_occluded':
+                        base_color = (0, 0, 180)  # Red for fully occluded
+                    elif occlusion_status == 'partially_occluded':
+                        base_color = (0, 180, 180)  # Yellow for partially occluded
+                    else:
+                        base_color = (180, 0, 0)  # Blue for out of frame
+                    
+                    # Draw prediction lines
+                    last_bbox = person_data.get('bbox')
+                    if last_bbox is None:
+                        continue
+                        
+                    # Start from center of current bbox
+                    start_x = int((last_bbox[0] + last_bbox[2]) / 2)
+                    start_y = int((last_bbox[1] + last_bbox[3]) / 2)
+                    
+                    # Draw each point in prediction
+                    for i, (pred_x, pred_y, _, _) in enumerate(future_points):
+                        # Skip if point is outside image bounds
+                        if (pred_x < 0 or pred_x >= image.shape[1] or
+                            pred_y < 0 or pred_y >= image.shape[0]):
+                            continue
+                        
+                        # Calculate alpha (transparency) based on prediction distance
+                        alpha = 1.0 - i / len(future_points)
+                        
+                        # Calculate point color with alpha
+                        point_color = tuple(int(c * alpha) for c in base_color)
+                        
+                        # Draw line segment
+                        if i == 0:
+                            cv2.line(image, (start_x, start_y), (int(pred_x), int(pred_y)), point_color, 2)
+                        else:
+                            prev_x, prev_y = future_points[i-1][0], future_points[i-1][1]
+                            cv2.line(image, (int(prev_x), int(prev_y)), (int(pred_x), int(pred_y)), point_color, 2)
+                        
+                        # Draw points with decreasing size
+                        point_size = max(1, int(5 * (1.0 - i / len(future_points))))
+                        cv2.circle(image, (int(pred_x), int(pred_y)), point_size, point_color, -1)
+                        
+                    # Add confidence indicator
+                    if track_quality > 0.7:
+                        # Draw a small indicator for high-quality prediction
+                        label = f"{method.upper()} ({track_quality:.1f})"
+                        cv2.putText(
+                            image,
+                            label,
+                            (start_x + 5, start_y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4,
+                            (255, 255, 255),
+                            1
+                        )
+        except Exception as e:
+            print(f"Error drawing predicted trajectories: {e}")
+
+    def _analyze_occlusions(self, tracked_persons):
+        """
+        Analyze occlusions between persons to build an occlusion graph.
+        This helps track which person is occluding whom and enables smarter occlusion handling.
+        
+        Args:
+            tracked_persons (dict): Dictionary of tracked persons
+        """
+        try:
+            # Reset occlusion graph for this frame
+            current_occlusion_graph = {}
+            
+            # Extract all valid bounding boxes
+            valid_persons = {}
+            for track_id, person in tracked_persons.items():
+                if 'bbox' in person and person['bbox'] is not None:
+                    valid_persons[track_id] = person
+            
+            if len(valid_persons) < 2:
+                # Not enough people for occlusions
+                self.occlusion_graph = {}
+                return
+            
+            # Check all pairs of persons for potential occlusions
+            track_ids = list(valid_persons.keys())
+            
+            # Build size-based depth ordering (larger bboxes are likely closer to camera)
+            # This helps determine which person is in front when occlusions occur
+            size_ordering = []
+            for track_id in track_ids:
+                bbox = valid_persons[track_id]['bbox']
+                area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                size_ordering.append((track_id, area))
+            
+            # Sort by area (descending)
+            size_ordering.sort(key=lambda x: x[1], reverse=True)
+            self.depth_ordering = [track_id for track_id, _ in size_ordering]
+            
+            # Check each pair for overlaps
+            for i in range(len(track_ids)):
+                id1 = track_ids[i]
+                bbox1 = valid_persons[id1]['bbox']
+                
+                for j in range(i+1, len(track_ids)):
+                    id2 = track_ids[j]
+                    bbox2 = valid_persons[id2]['bbox']
+                    
+                    # Calculate IoU to determine if there's an overlap
+                    iou = self._calculate_iou(bbox1, bbox2)
+                    
+                    if iou > self.min_overlap_iou:
+                        # There's an overlap - determine which person is occluding the other
+                        # Several heuristics to determine occlusion ordering:
+                        
+                        # 1. Size heuristic: Larger bounding box is likely closer to camera
+                        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+                        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+                        
+                        # 2. Position heuristic: Lower in frame usually means closer to camera
+                        bottom1 = bbox1[3]
+                        bottom2 = bbox2[3]
+                        
+                        # 3. Occlusion heuristic: Check if one bbox contains the bottom of the other
+                        bottom_contained_1in2 = (bbox1[3] > bbox2[1] and bbox1[3] < bbox2[3] and
+                                                bbox1[0] > bbox2[0] and bbox1[2] < bbox2[2])
+                        bottom_contained_2in1 = (bbox2[3] > bbox1[1] and bbox2[3] < bbox1[3] and
+                                                bbox2[0] > bbox1[0] and bbox2[2] < bbox1[2])
+                        
+                        # Determine which person is in front based on heuristics
+                        id_front = None
+                        id_back = None
+                        
+                        # Lower bbox is usually in front
+                        if abs(bottom1 - bottom2) > 20:  # Significant difference in bottom position
+                            id_front = id1 if bottom1 > bottom2 else id2
+                            id_back = id2 if id_front == id1 else id1
+                        # Bottom contained is a strong indicator of occlusion
+                        elif bottom_contained_1in2:
+                            id_front = id2
+                            id_back = id1
+                        elif bottom_contained_2in1:
+                            id_front = id1
+                            id_back = id2
+                        # Fall back to size
+                        else:
+                            id_front = id1 if area1 > area2 else id2
+                            id_back = id2 if id_front == id1 else id1
+                        
+                        # Add to occlusion graph: key = occluding track, value = list of occluded tracks
+                        if id_front not in current_occlusion_graph:
+                            current_occlusion_graph[id_front] = []
+                        
+                        current_occlusion_graph[id_front].append(id_back)
+            
+            # Update the occlusion graph with temporal smoothing to avoid flickering
+            # If this is the first frame, just use the current graph
+            if not self.occlusion_graph:
+                self.occlusion_graph = current_occlusion_graph
+            else:
+                # Blend with previous frame's graph for stability
+                # Keep track of temporal consistency in occlusion relationships
+                for id_front, occluded_ids in current_occlusion_graph.items():
+                    if id_front not in self.occlusion_graph:
+                        self.occlusion_graph[id_front] = occluded_ids
+                    else:
+                        # Merge occluded IDs, prioritizing consistent occlusions
+                        for occluded_id in occluded_ids:
+                            if occluded_id not in self.occlusion_graph[id_front]:
+                                # New occlusion relationship
+                                self.occlusion_graph[id_front].append(occluded_id)
+                
+                # Update occlusion state history
+                for id_front, occluded_ids in self.occlusion_graph.items():
+                    for occluded_id in occluded_ids:
+                        occlusion_key = (id_front, occluded_id)
+                        
+                        if occlusion_key not in self.occlusion_state_history:
+                            self.occlusion_state_history[occlusion_key] = {
+                                'first_seen': self.frame_count,
+                                'last_seen': self.frame_count,
+                                'duration': 1,
+                                'consistent': True
+                            }
+                        else:
+                            history = self.occlusion_state_history[occlusion_key]
+                            history['last_seen'] = self.frame_count
+                            history['duration'] += 1
+                
+                # Prune old occlusion relationships that no longer exist
+                to_remove = []
+                for id_front, occluded_ids in self.occlusion_graph.items():
+                    if id_front not in current_occlusion_graph:
+                        # This occluder is no longer active
+                        to_remove.append(id_front)
+                        continue
+                    
+                    # Check each occluded ID
+                    occluded_to_remove = []
+                    for occluded_id in occluded_ids:
+                        if (id_front in current_occlusion_graph and 
+                            occluded_id not in current_occlusion_graph[id_front]):
+                            # This occlusion relationship no longer exists
+                            occluded_to_remove.append(occluded_id)
+                            
+                            # Update occlusion state history
+                            occlusion_key = (id_front, occluded_id)
+                            if occlusion_key in self.occlusion_state_history:
+                                # Mark as potentially ended if not seen for a few frames
+                                frames_since = self.frame_count - self.occlusion_state_history[occlusion_key]['last_seen']
+                                if frames_since > 5:  # Allow for some missing detections
+                                    to_remove.append(occlusion_key)
+                
+                    # Remove occluded IDs that are no longer valid
+                    for occluded_id in occluded_to_remove:
+                        if occluded_id in self.occlusion_graph[id_front]:
+                            self.occlusion_graph[id_front].remove(occluded_id)
+                
+                # Remove occlusion relationships that no longer exist
+                for id_front in to_remove:
+                    if id_front in self.occlusion_graph:
+                        del self.occlusion_graph[id_front]
+            
+            # Update spatial relationships based on occlusion graph
+            self._update_spatial_relationships(tracked_persons)
+                    
+        except Exception as e:
+            print(f"Error analyzing occlusions: {e}")
+
+    def _update_spatial_relationships(self, tracked_persons):
+        """
+        Update spatial relationships between people based on the occlusion graph.
+        This helps establish a pseudo-3D understanding of the scene.
+        
+        Args:
+            tracked_persons (dict): Dictionary of tracked persons
+        """
+        try:
+            # Skip if spatial reasoning is disabled
+            if not self.use_spatial_reasoning:
+                return
+                
+            # Reset spatial relationships
+            current_relationships = {}
+            
+            # Extract valid positions and size information
+            for track_id, person in tracked_persons.items():
+                if 'bbox' not in person or person['bbox'] is None:
+                    continue
+                    
+                bbox = person['bbox']
+                center_x = (bbox[0] + bbox[2]) / 2
+                center_y = (bbox[1] + bbox[3]) / 2
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                bottom_y = bbox[3]
+                
+                # Store position and size information
+                current_relationships[track_id] = {
+                    'position': (center_x, center_y),
+                    'bottom': bottom_y,
+                    'size': (width, height),
+                    'area': width * height,
+                    'in_front_of': [],
+                    'behind': [],
+                    'last_updated': self.frame_count
+                }
+                
+            # Update relationships based on occlusion graph
+            for occluder_id, occluded_ids in self.occlusion_graph.items():
+                if occluder_id in current_relationships:
+                    for occluded_id in occluded_ids:
+                        if occluded_id in current_relationships:
+                            # Occluder is in front of occluded
+                            current_relationships[occluder_id]['in_front_of'].append(occluded_id)
+                            current_relationships[occluded_id]['behind'].append(occluder_id)
+            
+            # Apply temporal consistency - blend with previous relationships
+            if not self.spatial_relationships:
+                self.spatial_relationships = current_relationships
+            else:
+                # Update existing relationships
+                for track_id, rel_data in current_relationships.items():
+                    if track_id in self.spatial_relationships:
+                        # Update position and size
+                        self.spatial_relationships[track_id]['position'] = rel_data['position']
+                        self.spatial_relationships[track_id]['bottom'] = rel_data['bottom']
+                        self.spatial_relationships[track_id]['size'] = rel_data['size']
+                        self.spatial_relationships[track_id]['area'] = rel_data['area']
+                        self.spatial_relationships[track_id]['last_updated'] = self.frame_count
+                        
+                        # Merge spatial relationships with temporal smoothing
+                        # Keep consistent in_front_of relationships
+                        for other_id in rel_data['in_front_of']:
+                            if other_id not in self.spatial_relationships[track_id]['in_front_of']:
+                                self.spatial_relationships[track_id]['in_front_of'].append(other_id)
+                        
+                        # Keep consistent behind relationships
+                        for other_id in rel_data['behind']:
+                            if other_id not in self.spatial_relationships[track_id]['behind']:
+                                self.spatial_relationships[track_id]['behind'].append(other_id)
+                    else:
+                        # New track, add the relationship
+                        self.spatial_relationships[track_id] = rel_data
+                
+                # Remove old relationships
+                to_remove = []
+                for track_id, rel_data in self.spatial_relationships.items():
+                    if track_id not in current_relationships:
+                        # Check if recently updated before removing
+                        frames_since = self.frame_count - rel_data['last_updated']
+                        if frames_since > 10:  # Keep relationship info for a while
+                            to_remove.append(track_id)
+                
+                for track_id in to_remove:
+                    if track_id in self.spatial_relationships:
+                        del self.spatial_relationships[track_id]
+        
+        except Exception as e:
+            print(f"Error updating spatial relationships: {e}")

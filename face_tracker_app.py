@@ -395,10 +395,6 @@ class FaceTrackerApp:
                     tracked_persons,
                     self.output_config.get('show_person_id', True)
                 )
-                
-            if self.output_config.get('show_face_recognition', True):
-                # Draw faces on top
-                result_frame = self.face_module.draw_faces(result_frame, tracked_faces)
             
             # Calculate and show FPS
             self.frame_count += 1
