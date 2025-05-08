@@ -1,0 +1,28 @@
+cameras:
+- enabled: true
+  name: default_camera
+  source: 0
+database:
+  db_path: face_database.db
+  min_detections_to_store: 3
+  update_period: 5
+  use_db: true
+face_recognition:
+  detection_size: (800, 800)
+  recognition_threshold: 0.6
+  top_k: 1
+  use_gpu: true
+output:
+  output_dir: ./detected_faces
+  save_detections: false
+  show_face_recognition: true
+  show_person_detection: true
+  show_person_id: true
+  show_video: true
+person_tracking:
+  confidence_threshold: 0.5
+  iou_threshold: 0.7
+  max_age: 30
+  min_hits: 3
+  model_path: yolov8n.pt
+  use_gpu: true
