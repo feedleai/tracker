@@ -90,6 +90,12 @@ class FaceTrackerApp:
         self.start_time = 0
         self.fps = 0
         
+        # Video output configuration
+        self.video_writer = None
+        self.output_video_path = "output.mp4"
+        self.output_video_fps = 30
+        self.output_video_size = None  # Will be set based on first frame
+        
         # Check for GPU availability - combining information from both modules
         self.using_gpu_face = getattr(self.face_module, 'ctx_id', -1) >= 0
         self.using_gpu_person = getattr(self.person_module, 'device', 'cpu') != 'cpu'
@@ -189,28 +195,83 @@ class FaceTrackerApp:
                     # If still no face ID, check if this person track_id has a historical face association
                     if person.get('face_id') is None and track_id in self.person_to_face_history:
                         history = self.person_to_face_history[track_id]
-                        # Only use history if it's from a recent frame (within 60 frames)
-                        if self.frame_count - history['last_seen'] < 60:
-                            # Restore the historical face ID and person ID
-                            person['face_id'] = history['face_id']
-                            self.person_module.tracker_to_face_map[track_id] = history['face_id']
+                        # Enhanced: Don't limit by frame count for historical matches
+                        # Use history regardless of when last seen - this helps with long-term reidentification
+                        # Restore the historical face ID and person ID
+                        person['face_id'] = history['face_id']
+                        self.person_module.tracker_to_face_map[track_id] = history['face_id']
+                        
+                        if history['person_id'] is not None:
+                            person['person_id'] = history['person_id']
+                            self.person_module.tracker_to_person_map[track_id] = history['person_id']
                             
-                            if history['person_id'] is not None:
-                                person['person_id'] = history['person_id']
-                                self.person_module.tracker_to_person_map[track_id] = history['person_id']
-                                
-                                # Update database with this association if we have a database
-                                if self.database is not None and not USING_STUB:
-                                    self.database.map_face_to_person(
-                                        history['face_id'], 
-                                        history['person_id']
-                                    )
-                            
-                            # Update the last seen time
-                            history['last_seen'] = self.frame_count
-                            
-                            # Skip further face detection for this person
-                            continue
+                            # Update database with this association if we have a database
+                            if self.database is not None and not USING_STUB:
+                                self.database.map_face_to_person(
+                                    history['face_id'], 
+                                    history['person_id']
+                                )
+                        
+                        # Update the last seen time
+                        history['last_seen'] = self.frame_count
+                        
+                        # Skip further face detection for this person
+                        continue
+                    
+                    # If still no face ID and we have a database, try to find a long-term match from the database
+                    if person.get('face_id') is None and self.database is not None and not USING_STUB:
+                        if 'appearance' in person and person['appearance'] is not None:
+                            # First attempt database reidentification by appearance features
+                            try:
+                                # Get the crop data for this person
+                                crop_data = self._get_person_crop(frame, person['bbox'])
+                                if crop_data and 'crop' in crop_data:
+                                    # Run face detection on the cropped region
+                                    faces = self.face_module.detect_faces(crop_data['crop'])
+                                    if faces and len(faces) > 0:
+                                        # Get face embedding and try to match with database
+                                        face_embedding = faces[0].embedding
+                                        person_id = self.database.find_matching_person(face_embedding, threshold=0.5)
+                                        
+                                        if person_id is not None:
+                                            # Found a database match - create a new face ID
+                                            new_id = self.face_module._generate_unique_face_id()
+                                            
+                                            # Associate with this person ID
+                                            person['face_id'] = new_id
+                                            person['person_id'] = person_id
+                                            self.person_module.tracker_to_face_map[track_id] = new_id
+                                            self.person_module.tracker_to_person_map[track_id] = person_id
+                                            
+                                            # Add to tracked faces
+                                            if hasattr(self.face_module, 'current_tracked_faces'):
+                                                self.face_module.current_tracked_faces[new_id] = {
+                                                    'embedding': face_embedding,
+                                                    'bbox': crop_data['adjusted_bbox'],
+                                                    'kps': faces[0].kps if hasattr(faces[0], 'kps') else None,
+                                                    'det_score': faces[0].det_score if hasattr(faces[0], 'det_score') else 1.0,
+                                                    'first_seen': getattr(self.face_module, 'frame_count', 0),
+                                                    'last_seen': getattr(self.face_module, 'frame_count', 0),
+                                                    'frames_since_seen': 0,
+                                                    'visible': True,
+                                                    'person_id': person_id
+                                                }
+                                            
+                                            # Store in history
+                                            self.person_to_face_history[track_id] = {
+                                                'face_id': new_id,
+                                                'person_id': person_id,
+                                                'last_seen': self.frame_count,
+                                                'appearance': person.get('appearance', None)
+                                            }
+                                            
+                                            # Update database mapping
+                                            self.database.map_face_to_person(new_id, person_id)
+                                            
+                                            # Skip further processing
+                                            continue
+                            except Exception as e:
+                                print(f"Error in database reidentification: {e}")
                     
                     # Run face detection on the cropped region
                     faces = self.face_module.detect_faces(crop_data['crop'])
@@ -449,6 +510,23 @@ class FaceTrackerApp:
                 2
             )
             
+            # Initialize video writer if it hasn't been created yet
+            if self.video_writer is None and frame is not None:
+                h, w = result_frame.shape[:2]
+                self.output_video_size = (w, h)
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self.video_writer = cv2.VideoWriter(
+                    self.output_video_path,
+                    fourcc,
+                    self.output_video_fps,
+                    self.output_video_size
+                )
+                print(f"Initialized video output: {self.output_video_path} ({w}x{h} @ {self.output_video_fps}fps)")
+            
+            # Write frame to output video
+            if self.video_writer is not None:
+                self.video_writer.write(result_frame)
+            
             # Show the result
             if self.output_config.get('show_video', True):
                 cv2.imshow('Face and Person Tracker', result_frame)
@@ -539,6 +617,11 @@ class FaceTrackerApp:
         print("Stopping Face Tracker Application...")
         self.running = False
         
+        # Release video writer
+        if self.video_writer is not None:
+            self.video_writer.release()
+            print(f"Video output saved to {self.output_video_path}")
+        
         # Stop all cameras
         self.camera_module.stop_all_cameras()
         
@@ -554,6 +637,7 @@ class FaceTrackerApp:
     def _try_reidentify_by_appearance(self, track_id, person_data, person_to_face_map):
         """
         Try to reidentify a person by appearance features when face is not visible.
+        Enhanced to better handle people with same clothes after occlusion.
         
         Args:
             track_id (int): Tracking ID of the person
@@ -564,11 +648,18 @@ class FaceTrackerApp:
         if person_data.get('face_id') is not None or 'appearance' not in person_data or person_data['appearance'] is None:
             return
             
-        best_similarity = 0.5  # Threshold for considering a match
+        best_similarity = 0.40  # Adjusted threshold for better matching of same clothes
         best_history_id = None
         
-        # Compare with all recent person histories
-        for history_id, history in self.person_to_face_history.items():
+        # First, try more recent history entries (prioritize recent occlusions)
+        recent_history_entries = [(history_id, history) for history_id, history in self.person_to_face_history.items()
+                                 if self.frame_count - history['last_seen'] < 300]  # About 10 seconds at 30fps
+        
+        # Then try all history entries if no recent match is found
+        all_history_entries = list(self.person_to_face_history.items())
+        
+        # Try recent entries first
+        for history_id, history in recent_history_entries:
             # Skip if no appearance data or no person ID
             if 'appearance' not in history or history['appearance'] is None or history['person_id'] is None:
                 continue
@@ -581,6 +672,13 @@ class FaceTrackerApp:
             try:
                 similarity = self.person_module._compare_appearances(person_data['appearance'], history['appearance'])
                 
+                # Check if the history entry was from an occluded person
+                was_occluded = history.get('occlusion_status', '') in ['fully_occluded', 'partially_occluded']
+                
+                # Boost scores for occluded tracks with good clothing matches 
+                if was_occluded and similarity > 0.5:
+                    similarity += min(0.15, (similarity - 0.5) * 0.3)
+                
                 # If similarity is good, consider it the same person
                 if similarity > best_similarity:
                     best_similarity = similarity
@@ -588,9 +686,41 @@ class FaceTrackerApp:
             except Exception as e:
                 print(f"Error comparing appearances: {e}")
         
+        # If no match found in recent history, try all history
+        if best_history_id is None and recent_history_entries != all_history_entries:
+            for history_id, history in all_history_entries:
+                # Skip if already checked in recent history
+                if history_id in [h[0] for h in recent_history_entries]:
+                    continue
+                    
+                # Skip if no appearance data or no person ID
+                if 'appearance' not in history or history['appearance'] is None or history['person_id'] is None:
+                    continue
+                    
+                # Skip if this person still has an active track
+                if history_id in self.person_module.tracked_persons:
+                    continue
+                    
+                # Compare appearances with a slightly higher threshold for older entries
+                try:
+                    similarity = self.person_module._compare_appearances(person_data['appearance'], history['appearance'])
+                    
+                    # If similarity is good, consider it the same person
+                    # Use a higher threshold for older history entries to prevent false matches
+                    if similarity > best_similarity + 0.05:
+                        best_similarity = similarity
+                        best_history_id = history_id
+                except Exception as e:
+                    print(f"Error comparing appearances: {e}")
+        
         # If we found a good match, use the historical IDs
         if best_history_id is not None:
             history = self.person_to_face_history[best_history_id]
+            
+            # Log if this was likely an occlusion recovery
+            was_occluded = history.get('occlusion_status', '') in ['fully_occluded', 'partially_occluded']
+            if was_occluded:
+                print(f"Recovered occluded person: Track {track_id} matched with occluded history {best_history_id} (score: {best_similarity:.2f})")
             
             # Copy face ID and person ID from history
             person_data['face_id'] = history['face_id']
@@ -607,22 +737,29 @@ class FaceTrackerApp:
                         history['person_id']
                     )
             
-            # Update the history record with this track
+            # Update the history record with this track - preserve occlusion status if present
+            occlusion_status = history.get('occlusion_status', None)
             self.person_to_face_history[track_id] = {
                 'face_id': history['face_id'],
                 'person_id': history['person_id'],
                 'last_seen': self.frame_count,
                 'appearance': person_data['appearance']
             }
+            
+            # Copy occlusion status if present
+            if occlusion_status is not None:
+                self.person_to_face_history[track_id]['occlusion_status'] = occlusion_status
 
 
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='Face Tracker Application')
     parser.add_argument('--config', type=str, default='config.yml', help='Path to configuration file')
+    parser.add_argument('--output', type=str, default='output.mp4', help='Path to output video file')
     args = parser.parse_args()
     
     app = FaceTrackerApp(args.config)
+    app.output_video_path = args.output
     app.start()
 
 

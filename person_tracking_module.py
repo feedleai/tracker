@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from collections import defaultdict
+import time
 
 
 class PersonTrackingModule:
@@ -49,7 +50,15 @@ class PersonTrackingModule:
         # Appearance & reID
         self.person_appearance_features = {}
         self.disappeared_tracks = {}
-        self.max_disappearance_frames = 120
+        # Enhanced: Increase max disappearance frames to support long-term reidentification (hours)
+        # Assuming 30fps, 3600 frames = 2 minutes, 216000 frames = 2 hours, 1080000 frames = 10 hours
+        self.max_disappearance_frames = config.get('max_disappearance_frames', 1080000)
+        
+        # Enable limiting the size of the disappeared tracks cache to prevent memory issues
+        self.max_disappeared_tracks = config.get('max_disappeared_tracks', 1000)
+        # Store full appearance feature history for each person
+        self.person_appearance_history = {}
+        self.max_appearance_history = config.get('max_appearance_history', 20)
 
         # Velocity & Kalman
         self.person_velocities = {}
@@ -797,6 +806,7 @@ class PersonTrackingModule:
         """
         Compare two appearance feature sets for similarity.
         Enhanced to handle the more detailed features from the improved extraction.
+        Further improved to better match same clothing after occlusion.
         
         Args:
             appearance1 (dict): First appearance features
@@ -814,8 +824,10 @@ class PersonTrackingModule:
                              k in appearance2.keys() and 
                              k not in ['aspect_ratio', 'height', 'area_ratio', 'dominant_colors']]
             
-            # Calculate histogram similarity
+            # Calculate histogram similarity with higher weight on torso region (clothing)
             hist_similarities = []
+            torso_similarities = []
+            
             for key in histogram_keys:
                 if key in appearance1 and key in appearance2:
                     try:
@@ -825,28 +837,48 @@ class PersonTrackingModule:
                             np.array(appearance2[key], dtype=np.float32).reshape(-1, 1),
                             cv2.HISTCMP_CORREL
                         )
-                        hist_similarities.append(max(0, sim))  # Ensure non-negative
+                        # Check if this is a torso feature (clothing region)
+                        if 'torso' in key:
+                            torso_similarities.append(max(0, sim))
+                        else:
+                            hist_similarities.append(max(0, sim))  # Ensure non-negative
                     except Exception as e:
                         print(f"Error comparing histogram {key}: {e}")
             
-            # Calculate histogram similarity as average of all histogram comparisons
-            histogram_similarity = np.mean(hist_similarities) if hist_similarities else 0.0
+            # Calculate histogram similarity with higher weight for torso/clothing features
+            histogram_similarity = 0.0
+            if hist_similarities and torso_similarities:
+                # Give 70% weight to torso region (clothing) if available
+                clothing_weight = 0.7
+                histogram_similarity = (clothing_weight * np.mean(torso_similarities) + 
+                                     (1.0 - clothing_weight) * np.mean(hist_similarities))
+            elif torso_similarities:
+                histogram_similarity = np.mean(torso_similarities)
+            elif hist_similarities:
+                histogram_similarity = np.mean(hist_similarities)
             
-            # Compare geometric features
+            # Calculate size similarity with some tolerance for occlusion changes
             size_similarities = []
             
-            # Aspect ratio similarity
+            # Aspect ratio similarity with tolerance
             if 'aspect_ratio' in appearance1 and 'aspect_ratio' in appearance2:
                 aspect1 = appearance1['aspect_ratio']
                 aspect2 = appearance2['aspect_ratio']
+                # More tolerance for aspect ratio changes during occlusion
                 aspect_sim = min(aspect1, aspect2) / max(aspect1, aspect2)
+                # Apply a boost for similar aspect ratios to help with occlusion scenarios
+                if aspect_sim > 0.7:  # If fairly similar
+                    aspect_sim = 0.7 + (aspect_sim - 0.7) * 0.3 / 0.3  # Boost closer matches
                 size_similarities.append(aspect_sim)
             
-            # Height similarity
+            # Height similarity with tolerance
             if 'height' in appearance1 and 'height' in appearance2:
                 height1 = appearance1['height']
                 height2 = appearance2['height']
                 height_sim = min(height1, height2) / max(height1, height2)
+                # Apply a boost for similar heights
+                if height_sim > 0.7:  # If fairly similar
+                    height_sim = 0.7 + (height_sim - 0.7) * 0.3 / 0.3
                 size_similarities.append(height_sim)
             
             # Area ratio similarity
@@ -859,7 +891,7 @@ class PersonTrackingModule:
             # Calculate size similarity as average of all size comparisons
             size_similarity = np.mean(size_similarities) if size_similarities else 0.0
             
-            # Compare dominant colors if available
+            # Compare dominant colors if available, with higher weight on clothing colors
             color_similarity = 0.0
             if ('dominant_colors' in appearance1 and 'dominant_colors' in appearance2 and
                 appearance1['dominant_colors'] is not None and appearance2['dominant_colors'] is not None):
@@ -877,14 +909,18 @@ class PersonTrackingModule:
                     avg_distance = np.mean(min_distances)
                     max_distance = 255 * np.sqrt(3)  # Maximum possible distance in RGB space
                     color_similarity = 1.0 - (avg_distance / max_distance)
+                    
+                    # Boost higher color similarities (better for same clothes matching)
+                    if color_similarity > 0.7:
+                        color_similarity = 0.7 + (color_similarity - 0.7) * 0.3 / 0.3
                 except Exception as e:
                     print(f"Error comparing dominant colors: {e}")
             
-            # Calculate weighted similarity
-            # Histograms are most important, then colors, then size
-            weighted_similarity = (0.6 * histogram_similarity + 
+            # Calculate weighted similarity with higher weight on clothing-related features
+            # Histograms and colors (clothing appearance) are more important for occlusion cases
+            weighted_similarity = (0.65 * histogram_similarity + 
                                   0.25 * color_similarity + 
-                                  0.15 * size_similarity)
+                                  0.1 * size_similarity)
             
             return max(0.0, min(1.0, weighted_similarity))
         except Exception as e:
@@ -894,6 +930,7 @@ class PersonTrackingModule:
     def _update_disappeared_tracks(self, current_tracks):
         """
         Update the cache of disappeared tracks to help with reidentification.
+        Enhanced to support long-term disappearances and limit cache size.
         
         Args:
             current_tracks (dict): Currently active tracks
@@ -904,6 +941,25 @@ class PersonTrackingModule:
             
             # Remove tracks that have been gone too long
             if self.disappeared_tracks[track_id]['frames_since_seen'] > self.max_disappearance_frames:
+                # Before deleting, store important features in long-term storage if the track has a person_id
+                person_id = self.disappeared_tracks[track_id].get('person_id')
+                if person_id is not None and 'appearance' in self.disappeared_tracks[track_id]:
+                    if person_id not in self.person_appearance_history:
+                        self.person_appearance_history[person_id] = []
+                    
+                    # Store appearance features with timestamp
+                    self.person_appearance_history[person_id].append({
+                        'appearance': self.disappeared_tracks[track_id]['appearance'],
+                        'timestamp': time.time(),
+                        'track_id': track_id
+                    })
+                    
+                    # Limit the history size
+                    if len(self.person_appearance_history[person_id]) > self.max_appearance_history:
+                        # Remove oldest entries
+                        self.person_appearance_history[person_id] = self.person_appearance_history[person_id][-self.max_appearance_history:]
+                
+                # Now delete the track
                 del self.disappeared_tracks[track_id]
         
         # Add newly disappeared tracks to the cache
@@ -913,7 +969,19 @@ class PersonTrackingModule:
                     # This track has disappeared, add to cache
                     track_data = self.tracked_persons[track_id].copy()
                     track_data['frames_since_seen'] = 0
+                    track_data['last_seen_time'] = time.time()  # Add absolute timestamp
                     self.disappeared_tracks[track_id] = track_data
+        
+        # If the disappeared tracks cache is too large, remove the oldest tracks
+        if len(self.disappeared_tracks) > self.max_disappeared_tracks:
+            # Sort by frames_since_seen (descending) and keep only the most recent
+            sorted_tracks = sorted(
+                self.disappeared_tracks.items(),
+                key=lambda x: x[1].get('frames_since_seen', 0)
+            )
+            
+            # Keep only the most recent tracks up to max_disappeared_tracks
+            self.disappeared_tracks = dict(sorted_tracks[:self.max_disappeared_tracks])
     
     def _handle_occlusions(self, frame, tracked_persons, predicted_boxes):
         """
@@ -1205,6 +1273,8 @@ class PersonTrackingModule:
         """
         Try to re-identify a new track with a recently disappeared track.
         This enhanced version uses multiple features for more robust matching.
+        Enhanced to support long-term tracking with improved thresholds.
+        Further improved to handle reidentification of same clothing after occlusion.
         
         Args:
             track_id (int): ID of the new track
@@ -1215,9 +1285,10 @@ class PersonTrackingModule:
             if track_data.get('face_id') is not None or track_data.get('person_id') is not None:
                 return
             
-            best_similarity = 0.45  # Slightly increased threshold for more reliable matching
+            best_similarity = 0.35  # Lower threshold to be more lenient with reidentification after occlusion
             best_match_id = None
             best_score = 0.0
+            best_timestamp = 0
             
             # Get current track position and dimensions
             if 'bbox' not in track_data or track_data['bbox'] is None:
@@ -1234,45 +1305,63 @@ class PersonTrackingModule:
                 try:
                     total_score = 0.0
                     feature_weights = {
-                        'appearance': 0.5,   # 50% weight to appearance
-                        'position': 0.25,    # 25% weight to position
+                        'appearance': 0.7,   # 70% weight to appearance - increased importance for clothing matching
+                        'position': 0.15,    # 15% weight to position - reduced importance for occlusion scenarios
                         'size': 0.15,        # 15% weight to size
-                        'velocity': 0.1      # 10% weight to velocity
                     }
                     used_features = {}
                     
                     # Skip if disappeared track has been gone too long
                     frames_gone = old_data.get('frames_since_seen', 0)
-                    if frames_gone > min(30, self.max_disappearance_frames / 3):  # More strict for reidentification
-                        continue
                     
-                    # 1. Compare appearances (if available)
+                    # Check if the old track was marked as occluded
+                    was_occluded = old_data.get('occlusion_status', '') in ['fully_occluded', 'partially_occluded']
+                    
+                    # For tracks that were occluded, apply different matching criteria
+                    # This is important for handling people with the same clothes reappearing
+                    if was_occluded:
+                        # For occluded tracks, we care more about appearance and less about position
+                        feature_weights = {
+                            'appearance': 0.85,  # Much higher weight to clothing appearance 
+                            'position': 0.05,    # Less weight to position (person might have moved)
+                            'size': 0.1,         # Less weight to size
+                        }
+                    
+                    # 1. Compare appearances (if available) - especially important for clothing matching
                     if ('appearance' in old_data and old_data['appearance'] is not None and
                         'appearance' in track_data and track_data['appearance'] is not None):
                         try:
                             appearance_sim = self._compare_appearances(track_data['appearance'], old_data['appearance'])
-                            used_features['appearance'] = appearance_sim
+                            
+                            # For previously occluded persons, boost high appearance similarity
+                            # This helps maintain identity for the same clothes
+                            if was_occluded and appearance_sim > 0.5:
+                                appearance_boost = min(0.2, (appearance_sim - 0.5) * 0.4) 
+                                appearance_sim += appearance_boost
+                                
+                            used_features['appearance'] = min(1.0, appearance_sim)
                         except Exception as e:
                             print(f"Error comparing appearances: {e}")
                     
-                    # 2. Compare position and motion
+                    # 2. Compare position and motion (less relevant for occlusion cases)
                     if 'bbox' in old_data:
                         try:
                             old_bbox = old_data['bbox']
                             old_x = (old_bbox[0] + old_bbox[2]) / 2
                             old_y = (old_bbox[1] + old_bbox[3]) / 2
                             
-                            # Account for motion
-                            if 'velocity' in old_data:
-                                vx, vy = old_data['velocity']
-                                # Predict where the disappeared track should be now
-                                old_x += vx * frames_gone
-                                old_y += vy * frames_gone
-                            
-                            # Calculate distance (scaled by frame size for normalization)
-                            distance = np.sqrt((curr_x - old_x)**2 + (curr_y - old_y)**2)
-                            max_distance = np.sqrt(self.frame_width**2 + self.frame_height**2) / 4
-                            position_sim = 1.0 - min(1.0, distance / max_distance)
+                            # For occluded tracks, use a more lenient position check
+                            if was_occluded:
+                                # Calculate distance but with more tolerance
+                                distance = np.sqrt((curr_x - old_x)**2 + (curr_y - old_y)**2)
+                                # Use a larger max distance for previously occluded tracks
+                                max_distance = np.sqrt(self.frame_width**2 + self.frame_height**2) / 3
+                                position_sim = 1.0 - min(1.0, distance / max_distance)
+                            else:
+                                # Regular position check for non-occluded tracks
+                                distance = np.sqrt((curr_x - old_x)**2 + (curr_y - old_y)**2)
+                                max_distance = np.sqrt(self.frame_width**2 + self.frame_height**2) / 4
+                                position_sim = 1.0 - min(1.0, distance / max_distance)
                             
                             used_features['position'] = position_sim
                         except Exception as e:
@@ -1284,38 +1373,28 @@ class PersonTrackingModule:
                             old_width = old_bbox[2] - old_bbox[0]
                             old_height = old_bbox[3] - old_bbox[1]
                             
-                            # Size similarity
+                            # Size similarity with more tolerance for occluded tracks
                             width_ratio = min(old_width, curr_width) / max(old_width, curr_width)
                             height_ratio = min(old_height, curr_height) / max(old_height, curr_height)
                             
-                            # Aspect ratio similarity
+                            # Aspect ratio similarity - more lenient for occluded tracks
                             old_aspect = old_width / old_height if old_height > 0 else 1.0
                             curr_aspect = curr_width / curr_height if curr_height > 0 else 1.0
                             aspect_ratio = min(old_aspect, curr_aspect) / max(old_aspect, curr_aspect)
                             
                             # Combined size similarity
-                            size_sim = (width_ratio + height_ratio + aspect_ratio) / 3
+                            if was_occluded:
+                                # For occluded tracks, be more lenient with size differences
+                                size_sim = (width_ratio * 0.3 + height_ratio * 0.3 + aspect_ratio * 0.4)
+                                # Apply a boost for reasonable similarities
+                                if size_sim > 0.5:
+                                    size_sim = 0.5 + (size_sim - 0.5) * 0.5
+                            else:
+                                size_sim = (width_ratio + height_ratio + aspect_ratio) / 3
+                                
                             used_features['size'] = size_sim
                         except Exception as e:
                             print(f"Error comparing size: {e}")
-                    
-                    # 4. Compare velocity directions (if available)
-                    if 'velocity' in old_data and 'velocity' in track_data:
-                        try:
-                            old_vx, old_vy = old_data['velocity']
-                            curr_vx, curr_vy = track_data['velocity']
-                            
-                            # Only compare if both have significant velocity
-                            old_v_mag = np.sqrt(old_vx**2 + old_vy**2)
-                            curr_v_mag = np.sqrt(curr_vx**2 + curr_vy**2)
-                            
-                            if old_v_mag > 1.0 and curr_v_mag > 1.0:
-                                # Calculate cosine similarity between velocity vectors
-                                dot_product = old_vx * curr_vx + old_vy * curr_vy
-                                velocity_sim = max(0, (dot_product / (old_v_mag * curr_v_mag) + 1) / 2)
-                                used_features['velocity'] = velocity_sim
-                        except Exception as e:
-                            print(f"Error comparing velocity: {e}")
                     
                     # Calculate weighted score
                     if used_features:
@@ -1326,14 +1405,22 @@ class PersonTrackingModule:
                         used_weights_sum = sum(feature_weights[f] for f in used_features.keys())
                         final_score = total_score / used_weights_sum if used_weights_sum > 0 else 0
                         
-                        # Reduce score based on time disappeared (fresher matches are better)
-                        time_discount = max(0.7, 1.0 - frames_gone * 0.01)
+                        # Get the timestamp for this track if available
+                        timestamp = old_data.get('last_seen_time', 0)
+                        
+                        # Apply a mild time-based discount (less penalty for occlusion reappearance)
+                        # For occluded tracks, we apply an even milder discount
+                        if was_occluded:
+                            time_discount = max(0.9, 1.0 - frames_gone * 0.000005)
+                        else:
+                            time_discount = max(0.8, 1.0 - frames_gone * 0.00001)
                         final_score *= time_discount
                         
                         # If this is the best match so far, remember it
                         if final_score > best_score:
                             best_score = final_score
                             best_match_id = old_id
+                            best_timestamp = timestamp
                 except Exception as e:
                     print(f"Error evaluating match for track {old_id}: {e}")
                     continue
@@ -1341,7 +1428,14 @@ class PersonTrackingModule:
             # If we found a good match, transfer identity information
             if best_match_id is not None and best_score > best_similarity:
                 try:
-                    print(f"Reidentified track {track_id} as previous track {best_match_id} with score {best_score:.2f}")
+                    # Check if this was an occluded track
+                    was_occluded = self.disappeared_tracks[best_match_id].get(
+                        'occlusion_status', '') in ['fully_occluded', 'partially_occluded']
+                    
+                    if was_occluded:
+                        print(f"Successfully reidentified occluded person! Track {track_id} matched with previously occluded track {best_match_id} (score: {best_score:.2f})")
+                    else:
+                        print(f"Reidentified track {track_id} as previous track {best_match_id} with score {best_score:.2f}")
                     
                     # Transfer face_id and person_id if available
                     if 'face_id' in self.disappeared_tracks[best_match_id] and self.disappeared_tracks[best_match_id]['face_id'] is not None:
@@ -1355,6 +1449,15 @@ class PersonTrackingModule:
                     # Transfer face_data if available
                     if 'face_data' in self.disappeared_tracks[best_match_id]:
                         track_data['face_data'] = self.disappeared_tracks[best_match_id]['face_data'].copy()
+                    
+                    # Log reidentification success with time information
+                    current_time = time.time()
+                    time_diff = current_time - best_timestamp if best_timestamp > 0 else 0
+                    # Convert to hours for more readable output
+                    hours_diff = time_diff / 3600.0
+                    
+                    if hours_diff > 0.5:  # Only log if more than 30 minutes
+                        print(f"Long-term reidentification: Person with ID {track_data['person_id']} reappeared after {hours_diff:.2f} hours")
                         
                     # Copy tracking history
                     if best_match_id in self.track_history:
@@ -1372,8 +1475,80 @@ class PersonTrackingModule:
                     del self.disappeared_tracks[best_match_id]
                 except Exception as e:
                     print(f"Error transferring identity information: {e}")
+                    
+            # If we couldn't find a match in disappeared tracks, try the long-term appearance history
+            elif 'appearance' in track_data and track_data['appearance'] is not None:
+                self._try_reid_from_appearance_history(track_id, track_data)
+                
         except Exception as e:
             print(f"Error in _try_reid_disappeared_track: {e}")
+    
+    def _try_reid_from_appearance_history(self, track_id, track_data):
+        """
+        Try to re-identify a person using the long-term appearance history.
+        This is useful for people who have been gone for a very long time.
+        
+        Args:
+            track_id (int): ID of the new track
+            track_data (dict): Data for the new track
+        """
+        try:
+            # Skip if this track already has face/person identification
+            if track_data.get('face_id') is not None or track_data.get('person_id') is not None:
+                return
+                
+            if 'appearance' not in track_data or track_data['appearance'] is None:
+                return
+                
+            best_similarity = 0.5
+            best_person_id = None
+            best_score = 0.0
+            best_timestamp = 0
+            
+            # Check all person appearance histories
+            for person_id, history_entries in self.person_appearance_history.items():
+                for entry in history_entries:
+                    appearance_sim = self._compare_appearances(track_data['appearance'], entry['appearance'])
+                    
+                    if appearance_sim > best_score:
+                        best_score = appearance_sim
+                        best_person_id = person_id
+                        best_timestamp = entry.get('timestamp', 0)
+            
+            # If we found a good match, assign the person ID
+            if best_person_id is not None and best_score > best_similarity:
+                # Create a new face ID since we don't have the original
+                new_face_id = self._generate_unique_face_id()
+                
+                # Assign IDs
+                track_data['face_id'] = new_face_id
+                track_data['person_id'] = best_person_id
+                self.tracker_to_face_map[track_id] = new_face_id
+                self.tracker_to_person_map[track_id] = best_person_id
+                
+                # Log reidentification success with time information
+                current_time = time.time()
+                time_diff = current_time - best_timestamp if best_timestamp > 0 else 0
+                # Convert to hours for more readable output
+                hours_diff = time_diff / 3600.0
+                
+                if hours_diff > 0.5:  # Only log if more than 30 minutes
+                    print(f"Very long-term reidentification: Person with ID {best_person_id} reappeared after {hours_diff:.2f} hours (score: {best_score:.2f})")
+                
+        except Exception as e:
+            print(f"Error in _try_reid_from_appearance_history: {e}")
+    
+    def _generate_unique_face_id(self):
+        """
+        Generate a unique face ID for long-term reidentification.
+        
+        Returns:
+            int: A unique face ID
+        """
+        # Start with high numbers to avoid conflicts with face module IDs
+        face_id = getattr(self, '_next_face_id', 100000)
+        self._next_face_id = face_id + 1
+        return face_id
     
     def _is_within_bounds(self, bbox, margin=0.1):
         """

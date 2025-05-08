@@ -142,6 +142,7 @@ class DatabaseModule:
     def find_matching_person(self, face_embedding, threshold=0.6):
         """
         Find a matching person for the given face embedding.
+        Enhanced for long-term reidentification with optimized thresholds.
         
         Args:
             face_embedding (numpy.ndarray): The face embedding to match
@@ -152,58 +153,95 @@ class DatabaseModule:
         """
         try:
             # Get all person IDs
-            self.cursor.execute("SELECT id, num_detections FROM persons ORDER BY num_detections DESC")
-            person_data = [(row[0], row[1]) for row in self.cursor.fetchall()]
+            self.cursor.execute("""
+                SELECT p.id, p.num_detections, p.last_seen 
+                FROM persons p
+                ORDER BY p.num_detections DESC
+            """)
+            person_data = [(row[0], row[1], row[2]) for row in self.cursor.fetchall()]
             
             best_similarity = 0
             best_person_id = None
+            current_time = time.time()
             
             # Pre-process input embedding
             normalized_embedding = self._normalize_embedding(face_embedding)
             
             # For each person, get their embeddings and compare
             # Process persons with more detections first to prefer established identities
-            for person_id, num_detections in person_data:
-                # Get more recent embeddings for this person (max 10)
-                # This increases chance of matching with different face angles
-                self.cursor.execute(
-                    "SELECT embedding FROM face_embeddings WHERE person_id = ? ORDER BY timestamp DESC LIMIT 10",
-                    (person_id,)
-                )
-                
-                embeddings_rows = self.cursor.fetchall()
-                if not embeddings_rows:
-                    continue
-                
-                # Calculate similarity with each embedding
-                similarities = []
-                for row in embeddings_rows:
-                    try:
-                        stored_embedding = pickle.loads(row[0])
-                        normalized_stored = self._normalize_embedding(stored_embedding)
-                        similarity = self._calculate_similarity(normalized_embedding, normalized_stored)
-                        similarities.append(similarity)
-                    except Exception as e:
-                        print(f"Error calculating similarity: {e}")
+            for person_id, num_detections, last_seen in person_data:
+                try:
+                    # Calculate how long since this person was last seen (in hours)
+                    hours_since_seen = (current_time - last_seen) / 3600.0 if last_seen else 0
+                    
+                    # For long-term reidentification, get more embeddings than usual
+                    # This increases the chance of finding a match with different appearances
+                    embedding_limit = 15 if hours_since_seen > 1.0 else 10
+                    
+                    # For very long absences, we increase our coverage even more
+                    if hours_since_seen > 12.0:
+                        embedding_limit = 25  # Get even more embeddings for people gone for 12+ hours
+                    
+                    # Get more recent embeddings for this person
+                    self.cursor.execute(
+                        "SELECT embedding FROM face_embeddings WHERE person_id = ? ORDER BY timestamp DESC LIMIT ?",
+                        (person_id, embedding_limit)
+                    )
+                    
+                    embeddings_rows = self.cursor.fetchall()
+                    if not embeddings_rows:
                         continue
-                
-                # Sort similarities and get average of top 3 (if available)
-                # This makes matching more robust by considering multiple angles
-                if similarities:
-                    similarities.sort(reverse=True)
-                    top_n = min(3, len(similarities))
-                    avg_similarity = sum(similarities[:top_n]) / top_n
                     
-                    # Apply a small bonus to persons with more detections
-                    # This creates stability in identification
-                    detection_bonus = min(0.03, 0.001 * num_detections)
-                    adjusted_similarity = avg_similarity + detection_bonus
+                    # Calculate similarity with each embedding
+                    similarities = []
+                    for row in embeddings_rows:
+                        try:
+                            stored_embedding = pickle.loads(row[0])
+                            normalized_stored = self._normalize_embedding(stored_embedding)
+                            similarity = self._calculate_similarity(normalized_embedding, normalized_stored)
+                            similarities.append(similarity)
+                        except Exception as e:
+                            print(f"Error calculating similarity: {e}")
+                            continue
                     
-                    if adjusted_similarity > best_similarity:
-                        best_similarity = adjusted_similarity
-                        best_person_id = person_id
+                    # Sort similarities and get average of top N (if available)
+                    # For long-term reidentification, we take a smaller "best subset" to handle appearance changes
+                    if similarities:
+                        similarities.sort(reverse=True)
+                        
+                        # For long absences, we're more flexible - look at just the best matches
+                        # instead of averaging many matches which might include changed appearances
+                        if hours_since_seen > 1.0:
+                            top_n = min(2, len(similarities))  # Take only best 2 matches for long absences
+                        else:
+                            top_n = min(3, len(similarities))  # Use 3 for short absences
+                        
+                        avg_similarity = sum(similarities[:top_n]) / top_n
+                        
+                        # For long-term ID, detection bonus is more important to maintain identity consistency
+                        # This helps establish consistent recognition on reappearance
+                        detection_bonus = min(0.05, 0.001 * num_detections)
+                        
+                        # For people who've been seen many times, give an extra bonus to maintain stability
+                        if num_detections > 100:
+                            detection_bonus += 0.02
+                        
+                        # For long absences, we're more lenient with matching threshold
+                        # to account for appearance changes (clothing, hair, etc.)
+                        threshold_adjustment = min(0.07, hours_since_seen * 0.005)
+                        effective_threshold = max(0.4, threshold - threshold_adjustment)
+                        
+                        adjusted_similarity = avg_similarity + detection_bonus
+                        
+                        if adjusted_similarity > best_similarity:
+                            best_similarity = adjusted_similarity
+                            best_person_id = person_id
+                except Exception as e:
+                    print(f"Error processing person {person_id}: {e}")
+                    continue
             
-            # Return the best match if it's above the threshold
+            # Return the best match if it's above the effective threshold
+            # For long-term identification, we're more lenient with very frequent faces
             if best_similarity >= threshold:
                 return best_person_id
             
@@ -442,21 +480,29 @@ class DatabaseModule:
             
     def update_person_for_face_embedding(self, face_embedding, face_id, force_update=False):
         """
-        Update the person ID for a face embedding, ensuring it's associated with the correct person.
+        Update person information for a face embedding and face ID.
+        Enhanced for better long-term recognition.
         
         Args:
             face_embedding (numpy.ndarray): The face embedding
-            face_id (int): The face ID from face detection
-            force_update (bool): Whether to force an update even if a mapping exists
+            face_id (int): Face ID to map
+            force_update (bool): Force update the person even if it's already mapped
             
         Returns:
-            int: The associated person ID or None on failure
+            int: Matched or created person ID
         """
         try:
-            # Check if this face ID already has a person ID mapping
+            # Check if this face ID already has a person ID
             if not force_update:
-                existing_person_id = self.get_person_id_from_face_id(face_id)
-                if existing_person_id is not None:
+                self.cursor.execute(
+                    "SELECT person_id FROM face_id_mapping WHERE face_id = ?",
+                    (face_id,)
+                )
+                result = self.cursor.fetchone()
+                
+                if result is not None and result[0] is not None:
+                    existing_person_id = result[0]
+                    
                     # Update last seen time
                     current_time = time.time()
                     self.cursor.execute(
@@ -464,10 +510,16 @@ class DatabaseModule:
                         (current_time, face_id)
                     )
                     
+                    # Update last_seen in persons table too
+                    self.cursor.execute(
+                        "UPDATE persons SET last_seen = ? WHERE id = ?",
+                        (current_time, existing_person_id)
+                    )
+                    
                     # Check if this embedding provides new information
                     # Get recent embeddings for this person
                     self.cursor.execute(
-                        "SELECT embedding FROM face_embeddings WHERE person_id = ? ORDER BY timestamp DESC LIMIT 5",
+                        "SELECT embedding FROM face_embeddings WHERE person_id = ? ORDER BY timestamp DESC LIMIT 10",
                         (existing_person_id,)
                     )
                     
@@ -492,11 +544,18 @@ class DatabaseModule:
                             (existing_person_id, embedding_blob, current_time)
                         )
                     
+                    # Always update num_detections to track frequency
+                    self.cursor.execute(
+                        "UPDATE persons SET num_detections = num_detections + 1 WHERE id = ?",
+                        (existing_person_id,)
+                    )
+                    
                     self.conn.commit()
                     return existing_person_id
             
             # Find the best matching person for this face embedding
-            person_id = self.find_matching_person(face_embedding)
+            # Use a lower threshold for long-term tracking to better handle reappearance
+            person_id = self.find_matching_person(face_embedding, threshold=0.5)
             
             # If no match, create a new person with the same ID as the face ID
             if person_id is None:
@@ -504,26 +563,44 @@ class DatabaseModule:
             else:
                 # Check if this embedding is sufficiently different from existing ones
                 self.cursor.execute(
-                    "SELECT embedding FROM face_embeddings WHERE person_id = ? ORDER BY timestamp DESC LIMIT 5",
+                    "SELECT embedding FROM face_embeddings WHERE person_id = ? ORDER BY timestamp DESC LIMIT 10",
                     (person_id,)
                 )
                 
                 embeddings_rows = self.cursor.fetchall()
                 is_unique = True
+                best_similarity = 0
                 
                 for row in embeddings_rows:
                     stored_embedding = pickle.loads(row[0])
                     similarity = self._calculate_similarity(face_embedding, stored_embedding)
+                    best_similarity = max(best_similarity, similarity)
                     
                     # If similarity is above 0.9, this embedding is too similar to existing ones
                     if similarity > 0.9:
                         is_unique = False
                         break
                 
-                # Update the existing person with the new embedding only if it's unique
-                if is_unique:
+                # Store new embeddings in these cases:
+                # 1. If it's unique (not too similar to existing embeddings)
+                # 2. If it's similar but not identical (0.7-0.9 range) and we don't have many embeddings
+                # This helps build a more robust embedding set for long-term identification
+                should_store = is_unique or (
+                    best_similarity > 0.7 and 
+                    best_similarity < 0.9 and 
+                    len(embeddings_rows) < 20
+                )
+                
+                if should_store:
                     self.add_or_update_person(face_embedding, person_id)
-            
+                else:
+                    # Even if we don't store the embedding, update last_seen time and detection count
+                    current_time = time.time()
+                    self.cursor.execute(
+                        "UPDATE persons SET last_seen = ?, num_detections = num_detections + 1 WHERE id = ?",
+                        (current_time, person_id)
+                    )
+                    
             # Map the face ID to the person ID
             self.map_face_to_person(face_id, person_id)
             
