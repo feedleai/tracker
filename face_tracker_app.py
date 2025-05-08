@@ -3,9 +3,43 @@ import cv2
 import argparse
 import time
 import sys
+import numpy as np
 from config_module import ConfigModule
 from camera_module import CameraModule
 from person_tracking_module import PersonTrackingModule
+
+# Import our new modules
+try:
+    from gait_module import GaitModule
+    USING_GAIT = True
+except ImportError:
+    print("WARNING: GaitModule not available, gait recognition disabled")
+    USING_GAIT = False
+    GaitModule = None
+
+try:
+    from pose_module import PoseModule
+    USING_POSE = True
+except ImportError:
+    print("WARNING: PoseModule not available, pose estimation disabled")
+    USING_POSE = False
+    PoseModule = None
+
+try:
+    from fusion_module import FusionModule
+    USING_FUSION = True
+except ImportError:
+    print("WARNING: FusionModule not available, multi-modal fusion disabled")
+    USING_FUSION = False
+    FusionModule = None
+
+try:
+    from occlusion_utils import OcclusionHandler
+    USING_OCCLUSION = True
+except ImportError:
+    print("WARNING: OcclusionHandler not available, occlusion handling disabled")
+    USING_OCCLUSION = False
+    OcclusionHandler = None
 
 # Check if we need to use the InsightFace stub
 try:
@@ -72,6 +106,34 @@ class FaceTrackerApp:
         person_tracking_config = self.config_module.get_person_tracking_config()
         self.person_module = PersonTrackingModule(person_tracking_config)
         
+        # Initialize gait recognition module if available
+        self.gait_module = None
+        if USING_GAIT and GaitModule is not None:
+            gait_config = self.config_module.get_gait_config()
+            self.gait_module = GaitModule(gait_config)
+            print("Gait recognition module initialized")
+            
+        # Initialize pose estimation module if available
+        self.pose_module = None
+        if USING_POSE and PoseModule is not None:
+            pose_config = self.config_module.get_pose_config()
+            self.pose_module = PoseModule(pose_config)
+            print("Pose estimation module initialized")
+            
+        # Initialize fusion module if available
+        self.fusion_module = None
+        if USING_FUSION and FusionModule is not None:
+            fusion_config = self.config_module.get_fusion_config()
+            self.fusion_module = FusionModule(fusion_config)
+            print("Multi-modal fusion module initialized")
+            
+        # Initialize occlusion handler if available
+        self.occlusion_handler = None
+        if USING_OCCLUSION and OcclusionHandler is not None:
+            occlusion_config = self.config_module.get_occlusion_config()
+            self.occlusion_handler = OcclusionHandler(occlusion_config)
+            print("Occlusion handler initialized")
+        
         # Store historical mapping between person tracking IDs and face IDs
         # This helps maintain consistent face IDs when faces reappear
         self.person_to_face_history = {}
@@ -99,15 +161,19 @@ class FaceTrackerApp:
         # Check for GPU availability - combining information from both modules
         self.using_gpu_face = getattr(self.face_module, 'ctx_id', -1) >= 0
         self.using_gpu_person = getattr(self.person_module, 'device', 'cpu') != 'cpu'
-        self.using_gpu = self.using_gpu_face or self.using_gpu_person
+        self.using_gpu_pose = getattr(self.pose_module, 'using_gpu', False) if self.pose_module else False
+        self.using_gpu = self.using_gpu_face or self.using_gpu_person or self.using_gpu_pose
         
         if self.using_gpu:
-            if self.using_gpu_face and self.using_gpu_person:
-                print("GPU acceleration is available and will be used for both face recognition and person tracking")
-            elif self.using_gpu_face:
-                print("GPU acceleration is available and will be used for face recognition only")
-            elif self.using_gpu_person:
-                print("GPU acceleration is available and will be used for person tracking only")
+            gpu_modules = []
+            if self.using_gpu_face:
+                gpu_modules.append("Face")
+            if self.using_gpu_person:
+                gpu_modules.append("Person")
+            if self.using_gpu_pose:
+                gpu_modules.append("Pose")
+            
+            print(f"GPU acceleration is available and will be used for: {', '.join(gpu_modules)}")
         else:
             print("GPU acceleration is not available, using CPU")
         
@@ -150,15 +216,60 @@ class FaceTrackerApp:
             # Step 1: Detect and track persons using YOLO and BoTSORT
             tracked_persons = self.person_module.detect_and_track(working_frame)
             
-            # Step 2: Detect and track faces
+            # Step 2: Handle occlusions if available
+            if self.occlusion_handler is not None:
+                # Detect occlusions between persons
+                tracked_persons = self.occlusion_handler.detect_occlusions(tracked_persons)
+                
+                # Predict positions for occluded tracks
+                tracked_persons = self.occlusion_handler.predict_occluded_positions(tracked_persons, frame.shape)
+                
+                # Draw occlusion visualization if enabled
+                if self.output_config.get('show_occlusions', True):
+                    result_frame = self.occlusion_handler.draw_occlusion_visualization(result_frame, tracked_persons)
+            
+            # Step 3: Detect and track faces
             tracked_faces = self.face_module.track_faces(working_frame)
             
-            # Step 3: Associate tracked persons with face identities
+            # Step 4: Run pose estimation if available
+            if self.pose_module is not None:
+                tracked_persons = self.pose_module.detect_poses(working_frame, tracked_persons)
+                
+                # Extract pose-based gait features
+                for track_id, person in tracked_persons.items():
+                    if 'keypoints' in person:
+                        pose_features = self.pose_module.extract_pose_features(track_id)
+                        if pose_features is not None:
+                            person['pose_features'] = pose_features
+            
+            # Step 5: Run gait analysis if available
+            if self.gait_module is not None:
+                # Update motion sequences and extract gait signatures
+                tracked_persons = self.gait_module.update_tracked_persons(tracked_persons, self.person_module)
+            
+            # Step 6: Associate tracked persons with face identities
             tracked_persons = self.person_module.update_face_associations(
                 tracked_persons, 
                 tracked_faces,
                 self.face_module  # Pass face module to get person IDs
             )
+            
+            # Step 7: Run multi-modal fusion if available
+            if self.fusion_module is not None:
+                tracked_persons = self.fusion_module.process_tracked_persons(tracked_persons)
+                
+                # Check for ID switches or low stability
+                for track_id, person in tracked_persons.items():
+                    if 'person_id' in person:
+                        # Get ID stability score
+                        stability = self.fusion_module.get_identification_stability(track_id)
+                        person['id_stability'] = stability
+                        
+                        # Check if ID switch is suspected
+                        if self.fusion_module.is_id_switch_suspected(track_id, person['person_id']):
+                            # Mark as suspected ID switch
+                            person['id_switch_suspected'] = True
+                            # Future enhancement: trigger additional verification
             
             # Create a mapping of person IDs to face IDs for consistent identity assignment
             person_to_face_map = {}
@@ -179,7 +290,7 @@ class FaceTrackerApp:
                         'appearance': person.get('appearance', None)
                     }
             
-            # Step 4: Get face crops from tracked persons if no face detected
+            # Step 8: Get face crops from tracked persons if no face detected
             person_face_crops = self.person_module.get_person_face_crops(working_frame, tracked_persons)
             
             # Process face crops for persons without face IDs
@@ -448,7 +559,7 @@ class FaceTrackerApp:
                         except Exception as e:
                             print(f"Error processing face crop: {e}")
             
-            # Step 5: Draw visualizations based on configuration
+            # Step 9: Draw visualizations based on configuration
             if self.output_config.get('show_person_detection', True):
                 # Draw persons first
                 result_frame = self.person_module.draw_persons(
@@ -456,6 +567,90 @@ class FaceTrackerApp:
                     tracked_persons,
                     self.output_config.get('show_person_id', True)
                 )
+                
+            # Draw pose information if available and enabled
+            if self.pose_module is not None and self.output_config.get('show_pose', True):
+                result_frame = self.pose_module.draw_poses(result_frame, tracked_persons)
+                
+            # Draw gait information if available and enabled
+            if self.gait_module is not None and self.output_config.get('show_gait', True):
+                # Draw gait-specific visualization if implemented
+                # Or we can add text overlays about gait status
+                for track_id, person in tracked_persons.items():
+                    if 'gait_signature' in person and 'bbox' in person:
+                        # Add a gait indicator
+                        bbox = person['bbox']
+                        x1, y1 = int(bbox[0]), int(bbox[1])
+                        
+                        # Draw a gait identification label
+                        gait_identified = person.get('gait_person_id') is not None
+                        color = (0, 255, 0) if gait_identified else (0, 165, 255)
+                        
+                        gait_text = "Gait ID: Yes" if gait_identified else "Gait ID: No"
+                        cv2.putText(
+                            result_frame, 
+                            gait_text, 
+                            (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            0.5, 
+                            color, 
+                            1
+                        )
+            
+            # Draw fusion information if available and enabled
+            if self.fusion_module is not None and self.output_config.get('show_fusion', True):
+                for track_id, person in tracked_persons.items():
+                    if 'person_id' in person and 'bbox' in person:
+                        bbox = person['bbox']
+                        x1, y1, x2, y2 = [int(c) for c in bbox]
+                        
+                        # Draw confidence and method
+                        if 'id_confidence' in person:
+                            fusion_text = f"ID: {person['person_id']} ({person['id_confidence']:.2f})"
+                            method_text = f"Method: {person.get('id_method', 'unknown')}"
+                            
+                            # Color coded by stability
+                            stability = person.get('id_stability', 1.0)
+                            
+                            # Green for stable, yellow for medium, red for unstable
+                            if stability > 0.8:
+                                color = (0, 255, 0)  # Green
+                            elif stability > 0.5:
+                                color = (0, 255, 255)  # Yellow
+                            else:
+                                color = (0, 0, 255)  # Red
+                                
+                            # Draw ID switch warning if suspected
+                            if person.get('id_switch_suspected', False):
+                                cv2.putText(
+                                    result_frame,
+                                    "ID SWITCH?",
+                                    (x1, y2 + 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (0, 0, 255),
+                                    2
+                                )
+                            
+                            cv2.putText(
+                                result_frame,
+                                fusion_text,
+                                (x1, y2 + 15),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                color,
+                                1
+                            )
+                            
+                            cv2.putText(
+                                result_frame,
+                                method_text,
+                                (x1, y2 + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                color,
+                                1
+                            )
             
             # Calculate and show FPS
             self.frame_count += 1
@@ -471,12 +666,15 @@ class FaceTrackerApp:
             
             # Add GPU status
             if self.using_gpu:
-                if self.using_gpu_face and self.using_gpu_person:
-                    info_line += " | GPU: Face+Person"
-                elif self.using_gpu_face:
-                    info_line += " | GPU: Face only"
-                elif self.using_gpu_person:
-                    info_line += " | GPU: Person only"
+                gpu_modules = []
+                if self.using_gpu_face:
+                    gpu_modules.append("Face")
+                if self.using_gpu_person:
+                    gpu_modules.append("Person")
+                if self.using_gpu_pose:
+                    gpu_modules.append("Pose")
+                
+                info_line += f" | GPU: {'+'.join(gpu_modules)}"
             else:
                 info_line += " | GPU: Disabled"
                 
@@ -500,6 +698,21 @@ class FaceTrackerApp:
             
             # Add number of tracked persons and faces
             info_line2 = f"Tracked Persons: {len(tracked_persons)} | Tracked Faces: {len(tracked_faces)}"
+            
+            # Add information about active recognition modules
+            active_modules = []
+            if self.gait_module is not None:
+                active_modules.append("Gait")
+            if self.pose_module is not None:
+                active_modules.append("Pose")
+            if self.fusion_module is not None:
+                active_modules.append("Fusion")
+            if self.occlusion_handler is not None:
+                active_modules.append("Occlusion")
+                
+            if active_modules:
+                info_line2 += f" | Active Modules: {', '.join(active_modules)}"
+                
             cv2.putText(
                 result_frame,
                 info_line2,
