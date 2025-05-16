@@ -275,63 +275,113 @@ class OcclusionHandler:
         Returns:
             numpy.ndarray: Frame with occlusion visualization
         """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return frame
+            
         result_frame = frame.copy()
         
         for track_id, person in tracked_persons.items():
-            if 'occlusion_status' not in person or 'bbox' not in person:
-                continue
+            try:
+                if 'occlusion_status' not in person or 'bbox' not in person:
+                    continue
+                    
+                if person.get('bbox') is None:
+                    continue
                 
-            status = person['occlusion_status']
-            bbox = person['bbox']
-            
-            # Draw bounding box with color based on occlusion status
-            x1, y1, x2, y2 = [int(c) for c in bbox]
-            
-            if status == 'visible':
-                color = (0, 255, 0)  # Green
-            elif status == 'partially_occluded':
-                color = (0, 165, 255)  # Orange
-            else:  # fully_occluded
-                color = (0, 0, 255)  # Red
-            
-            cv2.rectangle(result_frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Draw status text
-            cv2.putText(
-                result_frame,
-                status,
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1
-            )
-            
-            # Draw predicted position if occluded
-            if status != 'visible' and 'predicted_bbox' in person:
-                pred_bbox = person['predicted_bbox']
-                px1, py1, px2, py2 = [int(c) for c in pred_bbox]
+                status = person['occlusion_status']
+                bbox = person['bbox']
                 
-                # Draw dashed box for prediction
-                self._draw_dashed_rectangle(
+                # Ensure bbox is valid
+                try:
+                    if isinstance(bbox, np.ndarray):
+                        bbox_array = bbox
+                    else:
+                        bbox_array = np.array(bbox)
+                        
+                    if len(bbox_array) != 4:
+                        continue
+                        
+                    x1, y1, x2, y2 = [int(c) for c in bbox_array]
+                except (ValueError, TypeError, IndexError) as e:
+                    print(f"Invalid bbox format for track {track_id}: {e}")
+                    continue
+                
+                # Validate coordinates are within frame bounds
+                h, w = result_frame.shape[:2]
+                x1 = max(0, min(x1, w-1))
+                y1 = max(0, min(y1, h-1))
+                x2 = max(0, min(x2, w-1))
+                y2 = max(0, min(y2, h-1))
+                
+                if x1 >= x2 or y1 >= y2:
+                    continue
+                
+                # Draw bounding box with color based on occlusion status
+                if status == 'visible':
+                    color = (0, 255, 0)  # Green
+                elif status == 'partially_occluded':
+                    color = (0, 165, 255)  # Orange
+                else:  # fully_occluded
+                    color = (0, 0, 255)  # Red
+                
+                cv2.rectangle(result_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw status text
+                cv2.putText(
                     result_frame,
-                    (px1, py1),
-                    (px2, py2),
-                    color
-                )
-                
-                # Draw line from current to predicted
-                center_current = ((x1 + x2) // 2, (y1 + y2) // 2)
-                center_predicted = ((px1 + px2) // 2, (py1 + py2) // 2)
-                
-                cv2.line(
-                    result_frame,
-                    center_current,
-                    center_predicted,
+                    status,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
                     color,
-                    1,
-                    cv2.LINE_AA
+                    1
                 )
+                
+                # Draw predicted position if occluded
+                if status != 'visible' and 'predicted_bbox' in person and person['predicted_bbox'] is not None:
+                    try:
+                        pred_bbox = person['predicted_bbox']
+                        
+                        # Validate predicted bbox
+                        if len(pred_bbox) != 4:
+                            continue
+                            
+                        px1, py1, px2, py2 = [int(c) for c in pred_bbox]
+                        
+                        # Validate coordinates are within frame bounds
+                        px1 = max(0, min(px1, w-1))
+                        py1 = max(0, min(py1, h-1))
+                        px2 = max(0, min(px2, w-1))
+                        py2 = max(0, min(py2, h-1))
+                        
+                        if px1 >= px2 or py1 >= py2:
+                            continue
+                        
+                        # Draw dashed box for prediction
+                        self._draw_dashed_rectangle(
+                            result_frame,
+                            (px1, py1),
+                            (px2, py2),
+                            color
+                        )
+                        
+                        # Draw line from current to predicted
+                        center_current = ((x1 + x2) // 2, (y1 + y2) // 2)
+                        center_predicted = ((px1 + px2) // 2, (py1 + py2) // 2)
+                        
+                        cv2.line(
+                            result_frame,
+                            center_current,
+                            center_predicted,
+                            color,
+                            1,
+                            cv2.LINE_AA
+                        )
+                    except (ValueError, TypeError, IndexError) as e:
+                        print(f"Error drawing predicted bbox for track {track_id}: {e}")
+                        continue
+            except Exception as e:
+                print(f"Error drawing occlusion visualization for track {track_id}: {e}")
         
         return result_frame
     

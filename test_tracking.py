@@ -20,118 +20,52 @@ def parse_args():
                         help='Webcam ID to use if no input file is provided')
     parser.add_argument('--test_mode', type=str, choices=['all', 'face', 'gait', 'pose', 'occlusion'],
                         default='all', help='Test specific module')
+    parser.add_argument('--headless', action='store_true', default=True,
+                        help='Run in complete headless mode')
     
     return parser.parse_args()
-
-def create_test_config(args):
-    """Create a test-specific configuration based on args"""
-    # Check if the config file exists
-    if not os.path.exists(args.config):
-        print(f"Config file '{args.config}' not found. Creating default config.")
-        # Create basic config file
-        with open(args.config, 'w') as f:
-            f.write("""
-cameras:
-  sources:
-    - name: Default Camera
-      source: 0
-      type: webcam
-  default_camera: Default Camera
-
-face_recognition:
-  model: buffalo_l
-  detection_threshold: 0.5
-  recognition_threshold: 0.5
-  use_gpu: true
-
-person_tracking:
-  model_weights: models/yolov5m.pt
-  confidence_threshold: 0.4
-  track_buffer: 30
-  match_threshold: 0.8
-  use_gpu: true
-
-gait_recognition:
-  sequence_length: 20
-  min_track_length: 10
-  similarity_threshold: 0.7
-  smoothing_window: 7
-  feature_dim: 128
-  db_path: gait_database.pkl
-
-pose_estimation:
-  model_path: models/pose
-  confidence_threshold: 0.5
-  use_gpu: true
-  max_history: 30
-
-fusion:
-  face_weight: 0.6
-  gait_weight: 0.25
-  pose_weight: 0.15
-  appearance_weight: 0.2
-  motion_weight: 0.1
-  fusion_threshold: 0.55
-  adaptive_weights: true
-  time_window: 5.0
-
-occlusion:
-  overlap_threshold: 0.5
-  min_area_ratio: 0.3
-  max_history: 20
-
-database:
-  use_db: true
-  db_path: face_database.db
-
-output:
-  show_video: true
-  show_person_detection: true
-  show_person_id: true
-  show_pose: true
-  show_gait: true
-  show_fusion: true
-  show_occlusions: true
-  save_detections: false
-  output_dir: ./detected_faces
-""")
-
-    # If input video is provided, modify camera config
-    if args.input is not None:
-        # Ensure the input file exists
-        if not os.path.exists(args.input):
-            print(f"Input file '{args.input}' not found.")
-            return
-
-        # Create a temporary config with the input video
-        temp_config_path = "temp_config.yml"
-        with open(args.config, 'r') as f:
-            config_data = f.read()
-            
-        # Replace camera section
-        config_data = config_data.replace(
-            "cameras:",
-            f"""cameras:
-  sources:
-    - name: Test Video
-      source: {args.input}
-      type: video
-  default_camera: Test Video"""
-        )
-        
-        with open(temp_config_path, 'w') as f:
-            f.write(config_data)
-            
-        return temp_config_path
-        
-    return args.config
 
 def main():
     """Main test function"""
     args = parse_args()
     
-    # Create test configuration
-    config_path = create_test_config(args)
+    # Use the provided config file directly instead of creating a new one
+    config_path = args.config
+    
+    # If input video is provided, override the config
+    if args.input is not None and os.path.exists(args.input):
+        print(f"Using input video file: {args.input}")
+        # Create a temporary config to override the camera source
+        with open(config_path, 'r') as f:
+            config_data = f.read()
+            
+        # Update the video source
+        temp_config_path = "temp_config.yml"
+        # Look for the video_file entry and enable it
+        if "video_file" in config_data:
+            config_data = config_data.replace(
+                "- enabled: false\n  name: video_file", 
+                f"- enabled: true\n  name: video_file"
+            )
+            config_data = config_data.replace(
+                'source: "samples/sample_video.mp4"', 
+                f'source: "{args.input}"'
+            )
+        else:
+            # Add a new video source if not found
+            config_data += f"""
+- enabled: true
+  name: video_file
+  source: "{args.input}"
+"""
+        
+        with open(temp_config_path, 'w') as f:
+            f.write(config_data)
+            
+        config_path = temp_config_path
+    
+    # Check camera configuration
+    print(f"Using config file: {config_path}")
     
     # Initialize tracker app
     app = FaceTrackerApp(config_path)
@@ -181,9 +115,17 @@ def main():
             # Get video information
             video = cv2.VideoCapture(app.output_video_path)
             fps = video.get(cv2.CAP_PROP_FPS)
-            frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Guard against None values that might cause int() conversion errors
+            frame_count_val = video.get(cv2.CAP_PROP_FRAME_COUNT)
+            width_val = video.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height_val = video.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            
+            # Convert to int with None checking
+            frame_count = int(frame_count_val) if frame_count_val is not None else 0
+            width = int(width_val) if width_val is not None else 0
+            height = int(height_val) if height_val is not None else 0
+            
             duration = frame_count / fps if fps > 0 else 0
             video.release()
             

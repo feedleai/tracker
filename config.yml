@@ -1,42 +1,66 @@
+cameras:
+- enabled: true
+  name: default_camera
+  source: "http://127.0.0.1:8888/administration/index.m3u8"
+- enabled: false
+  name: video_file
+  source: "samples/sample_video.mp4"
+database:
+  db_path: face_database.db
+  min_detections_to_store: 3
+  update_period: 5
+  use_db: true
 face_recognition:
   detection_size: (800, 800)
   recognition_threshold: 0.6
   top_k: 1
   use_gpu: true
-
+fusion:
+  adaptive_weights: true
+  appearance_weight: 0.2
+  face_weight: 0.6
+  fusion_threshold: 0.55
+  gait_weight: 0.25
+  motion_weight: 0.1
+  pose_weight: 0.15
+  time_window: 5.0
+gait_recognition:
+  db_path: gait_database.pkl
+  feature_dim: 128
+  min_track_length: 10
+  sequence_length: 20
+  similarity_threshold: 0.7
+  smoothing_window: 7
+occlusion:
+  max_history: 20
+  min_area_ratio: 0.3
+  overlap_threshold: 0.5
+output:
+  output_dir: ./detected_faces
+  save_detections: false
+  show_face_recognition: true
+  show_person_detection: true
+  show_person_id: true
+  show_video: true
+  show_pose: true
+  show_gait: true
+  show_fusion: true
+  show_occlusions: true
+  show_preview: true
+  # HLS streaming configuration
+  use_hls: true
+  hls_output_dir: "./hls_output"
+  hls_segment_duration: "4s"
+  hls_always_remux: true
 person_tracking:
-  model_path: "yolov8n.pt"
   confidence_threshold: 0.5
   iou_threshold: 0.7
   max_age: 30
   min_hits: 3
+  model_path: yolov8n.pt
   use_gpu: true
-
-database:
-  db_path: "face_database.db"
-  use_db: true
-  min_detections_to_store: 3
-  update_period: 5  # Update database every N frames
-
-cameras:
-  # Local camera
-  - name: "default_camera"
-    source: "test2.mp4"
-    enabled: true
-  
-  # Example of additional camera sources
-  # - name: "front_door"
-  #   source: "rtsp://username:password@192.168.1.100:554/stream"
-  #   enabled: false
-  # 
-  # - name: "back_yard"
-  #   source: "http://192.168.1.101:8080/video"
-  #   enabled: false
-
-output:
-  show_video: true
-  save_detections: false
-  output_dir: "./detected_faces"
-  show_person_detection: true
-  show_face_recognition: true
-  show_person_id: true 
+pose_estimation:
+  confidence_threshold: 0.5
+  max_history: 30
+  model_path: models/pose
+  use_gpu: true

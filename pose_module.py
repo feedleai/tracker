@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import time
+import os
 
 class PoseModule:
     """
@@ -52,31 +53,57 @@ class PoseModule:
     def _initialize_model(self):
         """Initialize the OpenCV-based pose estimation model"""
         try:
-            # Try to load OpenPose model first
-            try:
-                # Use OpenPose if available
-                self.net = cv2.dnn.readNetFromCaffe(
-                    f"{self.model_path}/pose_deploy_linevec.prototxt",
-                    f"{self.model_path}/pose_iter_440000.caffemodel"
-                )
-                self.model_type = "openpose"
-                self.num_points = 18
-                print("Loaded OpenPose model for pose estimation")
-            except Exception as e:
-                # Fall back to MoveNet model
-                self.net = cv2.dnn.readNetFromTensorflow(
-                    f"{self.model_path}/movenet_lightning.pb"
-                )
-                self.model_type = "movenet"
-                self.num_points = 17
-                print("Loaded MoveNet model for pose estimation")
+            # Check if model paths exist
+            openpose_prototxt = f"{self.model_path}/pose_deploy_linevec.prototxt"
+            openpose_model = f"{self.model_path}/pose_iter_440000.caffemodel"
+            movenet_model = f"{self.model_path}/movenet_lightning.pb"
+            
+            use_openpose = os.path.exists(openpose_prototxt) and os.path.exists(openpose_model)
+            use_movenet = os.path.exists(movenet_model)
+            
+            if not use_openpose and not use_movenet:
+                print(f"No pose estimation models found in {self.model_path}")
+                print("Download the models or update the model_path in the configuration")
+                self.net = None
+                self.model_type = None
+                return
+            
+            # Try to load OpenPose model first if files exist
+            if use_openpose:
+                try:
+                    self.net = cv2.dnn.readNetFromCaffe(openpose_prototxt, openpose_model)
+                    self.model_type = "openpose"
+                    self.num_points = 18
+                    print(f"Loaded OpenPose model for pose estimation from {openpose_prototxt}")
+                except Exception as e:
+                    print(f"Failed to load OpenPose model: {e}")
+                    use_openpose = False
+            
+            # Fall back to MoveNet model if OpenPose failed or files don't exist
+            if not use_openpose and use_movenet:
+                try:
+                    self.net = cv2.dnn.readNetFromTensorflow(movenet_model)
+                    self.model_type = "movenet"
+                    self.num_points = 17
+                    print(f"Loaded MoveNet model for pose estimation from {movenet_model}")
+                except Exception as e:
+                    print(f"Failed to load MoveNet model: {e}")
+                    self.net = None
+                    self.model_type = None
+                    return
             
             # Configure model and backend
-            if self.using_gpu:
-                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                print("Using GPU for pose estimation")
-            else:
+            if self.net is not None and self.using_gpu:
+                try:
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    print("Using GPU for pose estimation")
+                except Exception as e:
+                    print(f"GPU acceleration failed for pose estimation: {e}")
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                    print("Falling back to CPU for pose estimation")
+            elif self.net is not None:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 print("Using CPU for pose estimation")
@@ -474,48 +501,76 @@ class PoseModule:
         ]
         
         for track_id, person in tracked_persons.items():
-            if 'keypoints' not in person:
-                continue
+            try:
+                if 'keypoints' not in person or person['keypoints'] is None:
+                    continue
+                    
+                keypoints = person['keypoints']
+                if not keypoints:
+                    continue
                 
-            keypoints = person['keypoints']
-            
-            # Draw skeleton lines
-            for pair in pairs:
-                idx1 = self.keypoint_indices.get(pair[0])
-                idx2 = self.keypoint_indices.get(pair[1])
+                # Draw skeleton lines
+                for pair in pairs:
+                    try:
+                        idx1 = self.keypoint_indices.get(pair[0])
+                        idx2 = self.keypoint_indices.get(pair[1])
+                        
+                        if (idx1 is not None and idx2 is not None and 
+                            idx1 < len(keypoints) and idx2 < len(keypoints) and 
+                            keypoints[idx1] is not None and keypoints[idx2] is not None):
+                            
+                            pt1 = (int(keypoints[idx1][0]), int(keypoints[idx1][1]))
+                            pt2 = (int(keypoints[idx2][0]), int(keypoints[idx2][1]))
+                            
+                            # Verify points are in image bounds
+                            h, w = result_frame.shape[:2]
+                            if (0 <= pt1[0] < w and 0 <= pt1[1] < h and
+                                0 <= pt2[0] < w and 0 <= pt2[1] < h):
+                                cv2.line(result_frame, pt1, pt2, (0, 255, 255), 2)
+                    except (ValueError, TypeError, IndexError) as e:
+                        # Skip this pair if there's an error
+                        continue
                 
-                if (idx1 is not None and idx2 is not None and 
-                    idx1 < len(keypoints) and idx2 < len(keypoints) and 
-                    keypoints[idx1] is not None and keypoints[idx2] is not None):
-                    
-                    pt1 = (int(keypoints[idx1][0]), int(keypoints[idx1][1]))
-                    pt2 = (int(keypoints[idx2][0]), int(keypoints[idx2][1]))
-                    
-                    cv2.line(result_frame, pt1, pt2, (0, 255, 255), 2)
-            
-            # Draw keypoints
-            for i, keypoint in enumerate(keypoints):
-                if keypoint is not None:
-                    x, y = int(keypoint[0]), int(keypoint[1])
-                    cv2.circle(result_frame, (x, y), 4, (0, 255, 0), -1)
-            
-            # Add gait-related information if available
-            if 'joint_angles' in person and 'leg_stride' in person:
-                stride_length = person['leg_stride'].get('stride_length', 0)
-                left_knee = person['joint_angles'].get('left_knee', 0)
-                right_knee = person['joint_angles'].get('right_knee', 0)
+                # Draw keypoints
+                for i, keypoint in enumerate(keypoints):
+                    try:
+                        if keypoint is not None and len(keypoint) >= 2:
+                            x, y = int(keypoint[0]), int(keypoint[1])
+                            
+                            # Verify point is in image bounds
+                            h, w = result_frame.shape[:2]
+                            if 0 <= x < w and 0 <= y < h:
+                                cv2.circle(result_frame, (x, y), 4, (0, 255, 0), -1)
+                    except (ValueError, TypeError, IndexError) as e:
+                        # Skip this keypoint if there's an error
+                        continue
                 
-                # Get bounding box and draw info
-                if 'bbox' in person:
-                    bbox = person['bbox']
-                    x1, y1 = int(bbox[0]), int(bbox[1])
-                    
-                    info_text = f"Stride: {stride_length:.1f}"
-                    cv2.putText(result_frame, info_text, (x1, y1 - 40), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    knee_text = f"L: {left_knee:.1f}° R: {right_knee:.1f}°"
-                    cv2.putText(result_frame, knee_text, (x1, y1 - 25), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # Add gait-related information if available
+                try:
+                    if ('joint_angles' in person and 'leg_stride' in person and
+                        person['joint_angles'] is not None and person['leg_stride'] is not None):
+                        
+                        stride_length = person['leg_stride'].get('stride_length', 0)
+                        left_knee = person['joint_angles'].get('left_knee', 0)
+                        right_knee = person['joint_angles'].get('right_knee', 0)
+                        
+                        # Get bounding box and draw info
+                        if 'bbox' in person and person['bbox'] is not None:
+                            bbox = person['bbox']
+                            if len(bbox) == 4:
+                                x1, y1 = int(bbox[0]), int(bbox[1])
+                                
+                                info_text = f"Stride: {stride_length:.1f}"
+                                cv2.putText(result_frame, info_text, (x1, y1 - 40), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                                
+                                knee_text = f"L: {left_knee:.1f}° R: {right_knee:.1f}°"
+                                cv2.putText(result_frame, knee_text, (x1, y1 - 25), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                except Exception as e:
+                    # Skip gait info if there's an error
+                    continue
+            except Exception as e:
+                print(f"Error drawing pose for track {track_id}: {e}")
         
         return result_frame 

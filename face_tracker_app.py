@@ -82,6 +82,21 @@ class FaceTrackerApp:
         """
         print("Initializing Face Tracker Application...")
         
+        # Set OpenCV options to fix HEVC decoding issues
+        # These are global settings that affect all VideoCapture instances
+        try:
+            # Try to disable hardware acceleration for HEVC decoding which causes reference frame issues
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "video_codec;hevc_cuvid|hw_decoders;0|rtsp_transport;tcp"
+            
+            # Force OpenCV to use FFmpeg software decoding for problematic streams
+            os.environ["OPENCV_VIDEOIO_DEBUG"] = "1"  # Enable debug logs
+            os.environ["OPENCV_FFMPEG_DEBUG"] = "1"   # Enable FFmpeg debug information
+            os.environ["OPENCV_FFMPEG_THREADS"] = "1" # Limit FFmpeg to one thread to avoid async lock issues
+            
+            print("Set OpenCV FFmpeg options to improve HEVC stream stability")
+        except Exception as e:
+            print(f"Warning: Could not set environment variables for OpenCV: {e}")
+        
         # Load configuration
         self.config_module = ConfigModule(config_path)
         
@@ -151,12 +166,25 @@ class FaceTrackerApp:
         self.frame_count = 0
         self.start_time = 0
         self.fps = 0
+        self.display_available = False  # Default to headless mode
+        self.single_preview = self.config_module.get_output_config().get('show_preview', True)  # Single preview window
         
         # Video output configuration
         self.video_writer = None
         self.output_video_path = "output.mp4"
         self.output_video_fps = 30
         self.output_video_size = None  # Will be set based on first frame
+        
+        # HLS streaming configuration
+        self.use_hls = self.config_module.get_output_config().get('use_hls', False)
+        self.hls_output_dir = self.config_module.get_output_config().get('hls_output_dir', './hls_output')
+        self.hls_segment_duration = self.config_module.get_output_config().get('hls_segment_duration', '4s')
+        self.hls_always_remux = self.config_module.get_output_config().get('hls_always_remux', True)
+        self.ffmpeg_process = None
+        
+        if self.use_hls:
+            os.makedirs(self.hls_output_dir, exist_ok=True)
+            print(f"HLS streaming enabled. Output directory: {self.hls_output_dir}")
         
         # Check for GPU availability - combining information from both modules
         self.using_gpu_face = getattr(self.face_module, 'ctx_id', -1) >= 0
@@ -199,6 +227,23 @@ class FaceTrackerApp:
     def run_tracking_loop(self):
         """Run the main tracking loop"""
         print("Running tracking loop. Press 'q' to quit, 's' to switch cameras.")
+        
+        # Initialize preview window if enabled
+        if self.single_preview:
+            try:
+                cv2.namedWindow('Face Tracking Preview', cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('Face Tracking Preview', 1280, 720)
+                print("Preview window created successfully")
+                self.display_available = True
+            except Exception as e:
+                print(f"Error creating preview window: {e}")
+                print("Running in headless mode, preview disabled")
+                self.single_preview = False
+                self.display_available = False
+        
+        # Initialize HLS streaming if enabled
+        if self.use_hls:
+            self._initialize_hls_streaming()
         
         while self.running:
             # Get frame from active camera
@@ -727,29 +772,102 @@ class FaceTrackerApp:
             if self.video_writer is None and frame is not None:
                 h, w = result_frame.shape[:2]
                 self.output_video_size = (w, h)
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                self.video_writer = cv2.VideoWriter(
-                    self.output_video_path,
-                    fourcc,
-                    self.output_video_fps,
-                    self.output_video_size
-                )
-                print(f"Initialized video output: {self.output_video_path} ({w}x{h} @ {self.output_video_fps}fps)")
+                
+                # Try different codecs in order of preference
+                codecs = ['avc1', 'h264', 'XVID', 'MJPG', 'mp4v']
+                self.video_writer = None
+                
+                for codec in codecs:
+                    try:
+                        fourcc = cv2.VideoWriter_fourcc(*codec)
+                        writer = cv2.VideoWriter(
+                            self.output_video_path,
+                            fourcc,
+                            self.output_video_fps,
+                            self.output_video_size
+                        )
+                        
+                        # Check if writer was initialized properly
+                        if writer.isOpened():
+                            self.video_writer = writer
+                            print(f"Initialized video output: {self.output_video_path} ({w}x{h} @ {self.output_video_fps}fps) using codec: {codec}")
+                            break
+                        else:
+                            writer.release()
+                    except Exception as e:
+                        print(f"Failed to initialize video writer with codec {codec}: {e}")
+                
+                if self.video_writer is None:
+                    print("WARNING: Could not create video writer with any codec. Video output will not be saved.")
             
             # Write frame to output video
             if self.video_writer is not None:
-                self.video_writer.write(result_frame)
+                try:
+                    self.video_writer.write(result_frame)
+                except Exception as e:
+                    print(f"Error writing frame to video: {e}")
+                    # Try to reinitialize on error
+                    if self.video_writer is not None:
+                        self.video_writer.release()
+                        self.video_writer = None
             
-            # Show the result
-            if self.output_config.get('show_video', True):
-                cv2.imshow('Face and Person Tracker', result_frame)
-                
+            # Write frame to HLS stream if enabled
+            if self.use_hls and self.ffmpeg_process is not None:
+                try:
+                    # Resize frame for streaming if needed
+                    stream_frame = result_frame.copy()
+                    if stream_frame.shape[0] != 720 or stream_frame.shape[1] != 1280:
+                        stream_frame = cv2.resize(stream_frame, (1280, 720))
+                    
+                    # Check if process is still alive
+                    if self.ffmpeg_process.poll() is None:
+                        # Write frame to FFmpeg stdin
+                        self.ffmpeg_process.stdin.write(stream_frame.tobytes())
+                        self.ffmpeg_process.stdin.flush()  # Ensure data is sent
+                    else:
+                        # Process has terminated, check for errors
+                        error_output = self.ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
+                        print(f"FFmpeg process has terminated: {error_output}")
+                        # Try to restart the process
+                        self._cleanup_ffmpeg()
+                        self._initialize_hls_streaming()
+                except BrokenPipeError:
+                    print("FFmpeg pipe broken, restarting HLS stream...")
+                    self._cleanup_ffmpeg()
+                    self._initialize_hls_streaming()
+                except Exception as e:
+                    print(f"Error writing to HLS stream: {e}")
+                    # Reset FFmpeg process on error
+                    self._cleanup_ffmpeg()
+                    self.use_hls = False
+            
+            # Show in single preview window if enabled
+            if self.single_preview and self.display_available:
+                try:
+                    # Resize for preview if needed
+                    if result_frame.shape[1] > 1280 or result_frame.shape[0] > 720:
+                        preview_frame = cv2.resize(result_frame, (1280, 720))
+                    else:
+                        preview_frame = result_frame.copy()
+                    
+                    cv2.imshow('Face Tracking Preview', preview_frame)
+                except Exception as e:
+                    print(f"Error showing preview: {e}")
+                    self.single_preview = False
+                    self.display_available = False
+            
             # Save detected faces if configured
             if self.output_config.get('save_detections', False) and tracked_faces:
                 self._save_detected_faces(frame, tracked_faces)
-                
+            
             # Handle key presses
-            key = cv2.waitKey(1) & 0xFF
+            key = 255
+            if self.display_available:
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                # In headless mode, add a small delay
+                time.sleep(0.01)
+                
             if key == ord('q'):
                 self.running = False
             elif key == ord('s'):
@@ -784,7 +902,24 @@ class FaceTrackerApp:
             if not face_data.get('visible', True) and face_data.get('frames_since_seen', 0) > 3:
                 continue
                 
-            bbox = face_data['bbox'].astype(int)
+            # Check if bbox is valid and is a numpy array
+            if 'bbox' not in face_data or face_data['bbox'] is None:
+                continue
+                
+            try:
+                # Ensure bbox is a numpy array with integer values
+                if isinstance(face_data['bbox'], np.ndarray):
+                    bbox = face_data['bbox'].astype(int)
+                else:
+                    # Convert list or other iterable to numpy array
+                    bbox = np.array(face_data['bbox'], dtype=int)
+                
+                # Validate bbox dimensions
+                if bbox.shape[0] != 4:
+                    continue
+            except (TypeError, ValueError, AttributeError) as e:
+                print(f"Error converting bbox to int: {e}")
+                continue
             
             # Get person ID if available
             person_id = face_data.get('person_id', None)
@@ -835,6 +970,11 @@ class FaceTrackerApp:
             self.video_writer.release()
             print(f"Video output saved to {self.output_video_path}")
         
+        # Cleanup FFmpeg process
+        if self.use_hls:
+            print("Stopping HLS stream...")
+            self._cleanup_ffmpeg()
+        
         # Stop all cameras
         self.camera_module.stop_all_cameras()
         
@@ -842,11 +982,62 @@ class FaceTrackerApp:
         if self.database is not None:
             self.database.close()
         
-        # Close all windows
-        cv2.destroyAllWindows()
+        # Close preview window if open
+        if self.single_preview and self.display_available:
+            try:
+                cv2.destroyWindow('Face Tracking Preview')
+            except:
+                pass
+        
+        # Close all remaining windows
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
         
         print(f"Processed {self.frame_count} frames at {self.fps:.1f} FPS")
     
+    def _get_person_crop(self, frame, bbox):
+        """
+        Extract a crop of a person from a frame given their bounding box.
+        
+        Args:
+            frame (numpy.ndarray): Input frame
+            bbox (list): Bounding box [x1, y1, x2, y2]
+            
+        Returns:
+            dict: Dictionary with crop data including the image crop and adjusted bounding box
+        """
+        if frame is None or bbox is None:
+            return None
+            
+        try:
+            frame_height, frame_width = frame.shape[:2]
+            
+            # Ensure bbox coordinates are integers and within frame bounds
+            x1, y1, x2, y2 = [int(c) for c in bbox]
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(frame_width, x2)
+            y2 = min(frame_height, y2)
+            
+            # Skip invalid bounding boxes
+            if x1 >= x2 or y1 >= y2:
+                return None
+            
+            # Extract the crop
+            crop = frame[y1:y2, x1:x2]
+            
+            # Return crop data
+            return {
+                'crop': crop,
+                'bbox': [x1, y1, x2, y2],
+                'adjusted_bbox': [x1, y1, x2, y2]  # Same as bbox in this case
+            }
+        except Exception as e:
+            print(f"Error extracting person crop: {e}")
+            return None
+            
     def _try_reidentify_by_appearance(self, track_id, person_data, person_to_face_map):
         """
         Try to reidentify a person by appearance features when face is not visible.
@@ -962,6 +1153,117 @@ class FaceTrackerApp:
             # Copy occlusion status if present
             if occlusion_status is not None:
                 self.person_to_face_history[track_id]['occlusion_status'] = occlusion_status
+
+    def _initialize_hls_streaming(self):
+        """Initialize HLS streaming using FFmpeg"""
+        try:
+            import subprocess
+            import shutil
+            
+            # Check if ffmpeg is available
+            if shutil.which('ffmpeg') is None:
+                print("WARNING: FFmpeg not found in PATH. HLS streaming will be disabled.")
+                self.use_hls = False
+                return
+                
+            print("Initializing HLS streaming with FFmpeg...")
+            
+            # Create playlist directory
+            os.makedirs(self.hls_output_dir, exist_ok=True)
+            
+            # Define the FFmpeg command
+            segment_duration = self.hls_segment_duration.replace('s', '')
+            
+            # Full FFmpeg command - simplified for better compatibility
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-y',                     # Overwrite output files
+                '-f', 'rawvideo',         # Input format
+                '-vcodec', 'rawvideo',    # Input codec
+                '-pix_fmt', 'bgr24',      # Input pixel format (OpenCV uses BGR)
+                '-s', '1280x720',         # Input size
+                '-r', str(self.output_video_fps),  # Input frame rate
+                '-i', 'pipe:0',           # Read from stdin
+                '-c:v', 'libx264',        # Output codec
+                '-preset', 'ultrafast',   # Encoding preset
+                '-tune', 'zerolatency',   # Tune for low latency
+                '-f', 'hls',              # Output format
+                '-hls_time', segment_duration,  # Segment duration
+                '-hls_list_size', '10',   # Number of segments in playlist
+            ]
+            
+            # Add flags based on configuration
+            hls_flags = 'delete_segments+append_list'
+            if self.hls_always_remux:
+                hls_flags += '+program_date_time'
+            
+            ffmpeg_cmd.extend(['-hls_flags', hls_flags])
+            ffmpeg_cmd.append(os.path.join(self.hls_output_dir, 'stream.m3u8'))
+            
+            print(f"Starting FFmpeg with command: {' '.join(ffmpeg_cmd)}")
+            
+            # Start FFmpeg process with proper pipe handling
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**8,  # Use a large buffer
+                close_fds=True
+            )
+            
+            print(f"HLS streaming started. Stream available at: {self.hls_output_dir}/stream.m3u8")
+            
+        except Exception as e:
+            print(f"Error initializing HLS streaming: {e}")
+            self.use_hls = False
+            if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
+                self._cleanup_ffmpeg()
+
+    def _cleanup_ffmpeg(self):
+        """Cleanup FFmpeg process"""
+        if self.ffmpeg_process is not None:
+            try:
+                # Check if the process is still running
+                if self.ffmpeg_process.poll() is None:
+                    # Try to close stdin gracefully first
+                    try:
+                        self.ffmpeg_process.stdin.close()
+                    except:
+                        pass
+                    
+                    # Give it a moment to terminate gracefully
+                    import time
+                    time.sleep(0.5)
+                    
+                    # Check if it's still running
+                    if self.ffmpeg_process.poll() is None:
+                        # Force termination
+                        try:
+                            self.ffmpeg_process.terminate()
+                            self.ffmpeg_process.wait(timeout=2)
+                        except:
+                            # If termination fails, kill the process
+                            try:
+                                self.ffmpeg_process.kill()
+                                self.ffmpeg_process.wait(timeout=2)
+                            except:
+                                print("Failed to terminate FFmpeg process")
+                
+                # Close remaining pipes
+                try:
+                    self.ffmpeg_process.stdout.close()
+                except:
+                    pass
+                try:
+                    self.ffmpeg_process.stderr.close()
+                except:
+                    pass
+                    
+            except Exception as e:
+                print(f"Error cleaning up FFmpeg process: {e}")
+            finally:
+                self.ffmpeg_process = None
 
 
 def main():
