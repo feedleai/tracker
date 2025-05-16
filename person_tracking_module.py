@@ -21,17 +21,20 @@ class PersonTrackingModule:
 
         # Configure GPU/CPU usage
         self.use_gpu = config.get('use_gpu', True)
-        self.device = 'cuda:0'  # Force CUDA device
+        self.device = 'cpu'  # Default to CPU
 
         # Check if GPU is available
         try:
             import torch
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and self.use_gpu:
+                self.device = 'cuda:0'
                 print("Using GPU acceleration for person tracking")
             else:
-                raise RuntimeError("GPU acceleration required but CUDA is not available")
+                self.device = 'cpu'
+                print("GPU acceleration not available or disabled for person tracking, using CPU")
         except ImportError:
-            raise ImportError("PyTorch not available. Please install PyTorch with CUDA support")
+            print("PyTorch not available or CUDA support missing. Using CPU for person tracking.")
+            self.device = 'cpu'
 
         # Load YOLO model
         model_path = config.get('model_path', 'yolov8n.pt')
@@ -330,10 +333,25 @@ class PersonTrackingModule:
 
         for tid, pd in tracked_persons.items():
             try:
-                bb = pd.get('bbox')
-                if bb is None or len(bb) != 4:
+                # Verify bbox exists and is valid
+                if 'bbox' not in pd or pd['bbox'] is None:
                     continue
-                x1, y1, x2, y2 = map(int, bb)
+                    
+                # Handle different bbox formats
+                try:
+                    if isinstance(pd['bbox'], np.ndarray):
+                        bb = pd['bbox']
+                    else:
+                        bb = np.array(pd['bbox'])
+                    
+                    if len(bb) != 4:
+                        continue
+                        
+                    x1, y1, x2, y2 = map(int, bb)
+                except (ValueError, TypeError, IndexError) as e:
+                    print(f"Invalid bbox format for track {tid}: {e}")
+                    continue
+                
                 h, w = frame.shape[:2]
                 x1, x2 = max(0, x1), min(w-1, x2)
                 y1, y2 = max(0, y1), min(h-1, y2)

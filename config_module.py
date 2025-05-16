@@ -79,6 +79,22 @@ class ConfigModule:
         """Get output configuration"""
         return self.config.get('output', {})
     
+    def get_gait_config(self):
+        """Get gait recognition configuration"""
+        return self.config.get('gait_recognition', {})
+    
+    def get_pose_config(self):
+        """Get pose estimation configuration"""
+        return self.config.get('pose_estimation', {})
+    
+    def get_fusion_config(self):
+        """Get multi-modal fusion configuration"""
+        return self.config.get('fusion', {})
+    
+    def get_occlusion_config(self):
+        """Get occlusion handling configuration"""
+        return self.config.get('occlusion', {})
+    
     def _validate_config(self, config):
         """
         Validate the configuration structure.
@@ -155,6 +171,35 @@ class ConfigModule:
                 'show_person_detection': True,
                 'show_face_recognition': True,
                 'show_person_id': True
+            },
+            'gait_recognition': {
+                'sequence_length': 20,
+                'min_track_length': 10,
+                'similarity_threshold': 0.7,
+                'smoothing_window': 7,
+                'feature_dim': 128,
+                'db_path': 'gait_database.pkl'
+            },
+            'pose_estimation': {
+                'model_path': 'models/pose',
+                'confidence_threshold': 0.5,
+                'use_gpu': True,
+                'max_history': 30
+            },
+            'fusion': {
+                'face_weight': 0.6,
+                'gait_weight': 0.25,
+                'pose_weight': 0.15,
+                'appearance_weight': 0.2,
+                'motion_weight': 0.1,
+                'fusion_threshold': 0.55,
+                'adaptive_weights': True,
+                'time_window': 5.0
+            },
+            'occlusion': {
+                'overlap_threshold': 0.5,
+                'min_area_ratio': 0.3,
+                'max_history': 20
             }
         }
         
@@ -166,3 +211,75 @@ class ConfigModule:
             print(f"Error creating default configuration file: {e}")
             
         return default_config 
+
+    def _get_default_config(self):
+        """Get default configuration"""
+        return {
+            'cameras': {
+                'sources': [
+                    {
+                        'name': 'Default Camera',
+                        'source': 0,  # Default camera
+                        'type': 'webcam'
+                    }
+                ],
+                'default_camera': 'Default Camera'
+            },
+            'face_recognition': {
+                'model': 'buffalo_l',
+                'detection_threshold': 0.5,
+                'recognition_threshold': 0.5,
+                'use_gpu': True
+            },
+            'person_tracking': {
+                'model_weights': 'models/yolov5m.pt',
+                'confidence_threshold': 0.4,
+                'track_buffer': 30,
+                'match_threshold': 0.8,
+                'use_gpu': True
+            },
+            'gait_recognition': {
+                'sequence_length': 20,
+                'min_track_length': 10,
+                'similarity_threshold': 0.7,
+                'smoothing_window': 7,
+                'feature_dim': 128,
+                'db_path': 'gait_database.pkl'
+            },
+            'pose_estimation': {
+                'model_path': 'models/pose',
+                'confidence_threshold': 0.5,
+                'use_gpu': True,
+                'max_history': 30
+            },
+            'fusion': {
+                'face_weight': 0.6,
+                'gait_weight': 0.25,
+                'pose_weight': 0.15,
+                'appearance_weight': 0.2,
+                'motion_weight': 0.1,
+                'fusion_threshold': 0.55,
+                'adaptive_weights': True,
+                'time_window': 5.0
+            },
+            'occlusion': {
+                'overlap_threshold': 0.5,
+                'min_area_ratio': 0.3,
+                'max_history': 20
+            },
+            'database': {
+                'use_db': True,
+                'db_path': 'face_database.db'
+            },
+            'output': {
+                'show_video': True,
+                'show_person_detection': True,
+                'show_person_id': True,
+                'show_pose': True,
+                'show_gait': True,
+                'show_fusion': True,
+                'show_occlusions': True,
+                'save_detections': False,
+                'output_dir': './detected_faces'
+            }
+        } 
